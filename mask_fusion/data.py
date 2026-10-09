@@ -6,6 +6,7 @@ the answer is ordinary text. Training and inference use the same ChatML prefix.
 from __future__ import annotations
 
 import json
+import os
 import string
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
@@ -137,13 +138,40 @@ def tokenize_record(record: Mapping[str, Any], tokenizer: Any, model_config: Any
     }
 
 
+def normalize_data_paths(data_path: Any) -> List[Path]:
+    """Resolve one manifest or an ordered list/tuple of distinct manifests.
+
+    This only normalizes paths; reading/existence checks remain with the caller.
+    Repeated resolved paths are rejected rather than silently oversampling a file.
+    """
+    values = list(data_path) if isinstance(data_path, (list, tuple)) else [data_path]
+    if not values:
+        raise ValueError("At least one data manifest is required")
+    paths, seen = [], set()
+    for index, value in enumerate(values):
+        if not isinstance(value, (str, os.PathLike)):
+            raise ValueError(f"Data manifest {index} must be a path string or PathLike, got {type(value).__name__}")
+        raw = os.fspath(value)
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError(f"Data manifest {index} must be a nonempty path string")
+        path = Path(raw).expanduser().resolve()
+        if path in seen:
+            raise ValueError(f"Duplicate data manifest at position {index}: {path}")
+        seen.add(path)
+        paths.append(path)
+    return paths
+
+
 def read_records(data_path: Any) -> List[Dict[str, Any]]:
     """Read a JSONL file or a JSON array, retaining source line diagnostics."""
     path = Path(data_path)
     with path.open("r", encoding="utf-8-sig") as handle:
         raw = handle.read()
     if raw.lstrip().startswith("["):
-        records = json.loads(raw)
+        try:
+            records = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"{path}:{error.lineno}:{error.colno}: invalid JSON: {error.msg}") from error
         if not isinstance(records, list):
             raise ValueError(f"{path}: expected a JSON array")
     else:
@@ -164,13 +192,22 @@ def read_records(data_path: Any) -> List[Dict[str, Any]]:
 
 
 class QADataset(Dataset):
+    """Concatenate manifests in caller order, retaining per-record provenance.
+
+    ``data_paths`` always contains resolved manifests. ``data_path`` retains its
+    original single-Path API for one manifest and is a tuple for multiple files.
+    ``sources`` parallels ``records`` with source_file/source_index (zero-based)
+    without inserting or overwriting fields in the user's records.
+    """
     def __init__(
         self, data_path: Any, tokenizer: Any, processor: Any, model_config: Any,
         *, data_root: Optional[Any] = None, mode: str = "anyres_max_9", seed: int = 0,
         training: bool = True, max_text_length: int = 2048,
     ) -> None:
-        self.data_path = Path(data_path).resolve()
-        self.data_root = Path(data_root).resolve() if data_root is not None else self.data_path.parent
+        self.data_paths = normalize_data_paths(data_path)
+        self.data_path = self.data_paths[0] if len(self.data_paths) == 1 else tuple(self.data_paths)
+        explicit_root = Path(data_root).expanduser().resolve() if data_root is not None else None
+        self.data_root = explicit_root if explicit_root is not None else (self.data_paths[0].parent if len(self.data_paths) == 1 else None)
         self.tokenizer, self.processor, self.model_config = tokenizer, processor, model_config
         self.mode, self.seed, self.training = mode, int(seed), bool(training)
         self.max_text_length = int(max_text_length)
@@ -178,26 +215,30 @@ class QADataset(Dataset):
             raise ValueError("max_text_length must be positive")
         self.epoch = 0
         self.records = []
-        seen_ids = set()
-        for index, raw in enumerate(read_records(self.data_path)):
-            try:
-                record = normalize_record(raw, require_answer=training)
-                record.setdefault("id", str(index))
-                record_id = str(record["id"])
-                if record_id in seen_ids:
-                    raise ValueError(f"duplicate record id {record_id!r}")
-                seen_ids.add(record_id)
-                for key in ("image", "mask"):
-                    value = raw.get(key)
-                    if not isinstance(value, str) or not value.strip():
-                        raise ValueError(f"{key} must be a nonempty file path")
-                    path = Path(value)
-                    record[key] = str((path if path.is_absolute() else self.data_root / path).resolve())
-                    if not Path(record[key]).is_file():
-                        raise FileNotFoundError(f"Missing {key}: {record[key]}")
-                self.records.append(record)
-            except (ValueError, OSError) as error:
-                raise ValueError(f"{self.data_path}: record {index}: {error}") from error
+        self.sources = []
+        for source_path in self.data_paths:
+            source_root = explicit_root if explicit_root is not None else source_path.parent
+            seen_ids = set()
+            for source_index, raw in enumerate(read_records(source_path)):
+                try:
+                    record = normalize_record(raw, require_answer=training)
+                    record.setdefault("id", str(source_index))
+                    record_id = str(record["id"])
+                    if record_id in seen_ids:
+                        raise ValueError(f"duplicate record id {record_id!r}")
+                    seen_ids.add(record_id)
+                    for key in ("image", "mask"):
+                        value = raw.get(key)
+                        if not isinstance(value, str) or not value.strip():
+                            raise ValueError(f"{key} must be a nonempty file path")
+                        path = Path(value)
+                        record[key] = str((path if path.is_absolute() else source_root / path).resolve())
+                        if not Path(record[key]).is_file():
+                            raise FileNotFoundError(f"Missing {key}: {record[key]}")
+                    self.records.append(record)
+                    self.sources.append({"source_file": str(source_path), "source_index": source_index})
+                except (ValueError, OSError) as error:
+                    raise ValueError(f"{source_path}: record {source_index}: {error}") from error
 
     def __len__(self) -> int:
         return len(self.records)
@@ -206,6 +247,13 @@ class QADataset(Dataset):
         self.epoch = int(epoch)
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
+        source = self.sources[index]
+        try:
+            return self._load_sample(index)
+        except (ValueError, OSError, RuntimeError) as error:
+            raise ValueError(f"{source['source_file']}: record {source['source_index']}: {error}") from error
+
+    def _load_sample(self, index: int) -> Dict[str, Any]:
         from .preprocessing import load_mask, prepare_image_mask
 
         record = self.records[index]

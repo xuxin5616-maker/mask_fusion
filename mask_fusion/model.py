@@ -96,7 +96,7 @@ def read_adapter_config(path):
 
 def load_model(base_model, *, fusion_config=None, adapter_path=None,
                image_mode="anyres_max_9", device="cuda", dtype="bfloat16",
-               attn_implementation="sdpa", vision_tower=None):
+               attn_implementation="sdpa", vision_tower=None, defer_device=False):
     activate_vendor()
     from transformers import AutoTokenizer
     from llava.model.language_model.llava_qwen import LlavaQwenConfig, LlavaQwenForCausalLM
@@ -172,7 +172,10 @@ def load_model(base_model, *, fusion_config=None, adapter_path=None,
     observed = (int(actual.hidden_size), int(actual.patch_size), int(actual.image_size))
     if observed != expected:
         raise ValueError(f"Unsupported vision tower architecture: {observed}; vendor expects {expected}")
-    model.to(device=torch_device, dtype=dtypes[dtype])
+    # FSDP moves and shards individual wrapping units. Keeping the initial
+    # model on CPU avoids placing a complete replica on each GPU first.
+    initial_device = torch.device("cpu") if defer_device else torch_device
+    model.to(device=initial_device, dtype=dtypes[dtype])
     # Pruning is intentionally disabled in this baseline and all fusion modes.
     model.get_model().fastv_enabled = False
     model.get_model().vico_enabled = False
@@ -183,17 +186,27 @@ def load_model(base_model, *, fusion_config=None, adapter_path=None,
     return model, tokenizer, tower.image_processor
 
 
-def save_adapter(model, output, base_model, tokenizer=None):
-    """Save only trainable architecture weights; use safetensors, not pickle."""
+def save_adapter(model, output, base_model, tokenizer=None, *, weights=None):
+    """Save fusion/projector weights, optionally gathered by all FSDP ranks.
+
+    When ``weights`` is supplied, only the caller writes files and no module
+    state-dict operation (which may contain distributed collectives) occurs.
+    The caller supplies the underlying model for architecture metadata.
+    """
     from safetensors.torch import save_file
 
     folder = Path(output)
     folder.mkdir(parents=True, exist_ok=True)
-    core = model.get_model()
-    weights = {}
-    for prefix, module in (("mask_fusion", core.mask_fusion), ("mm_projector", core.mm_projector)):
-        weights.update({f"{prefix}.{key}": value.detach().cpu().contiguous().clone()
-                        for key, value in module.state_dict().items()})
+    if weights is None:
+        core = model.get_model()
+        weights = {}
+        for prefix, module in (("mask_fusion", core.mask_fusion), ("mm_projector", core.mm_projector)):
+            weights.update({f"{prefix}.{key}": value.detach().cpu().contiguous().clone()
+                            for key, value in module.state_dict().items()})
+    else:
+        if not weights or any(not key.startswith(("mask_fusion.", "mm_projector.")) for key in weights):
+            raise ValueError("Gathered adapter weights must contain only fusion/projector state")
+        weights = {key: value.detach().cpu().contiguous().clone() for key, value in weights.items()}
     temporary = folder / "adapter.safetensors.tmp"
     save_file(weights, str(temporary))
     os.replace(temporary, folder / "adapter.safetensors")

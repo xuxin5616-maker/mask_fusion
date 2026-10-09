@@ -1,6 +1,7 @@
 """CPU-sized behavioral checks; run with python -m unittest discover -s tests."""
 
 from dataclasses import replace
+import copy
 import unittest
 from unittest.mock import patch
 
@@ -246,6 +247,22 @@ class AttentionAndInitializationTests(unittest.TestCase):
                 self.assertTrue(torch.isfinite(gradient).all())
                 self.assertGreater(gradient.abs().sum().item(), 0)
         self.assertGreater(projector.weight.grad[:, 6:].abs().sum().item(), 0)
+
+    def test_fsdp_alpha_storage_preserves_bf16_outputs_and_gradients(self):
+        scalar = ExpertMaskFusion(6, 2, self.config)
+        vector = copy.deepcopy(scalar)
+        for layer in vector.layers:
+            layer.alpha.data = layer.alpha.data.reshape(1)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            scalar_output = scalar(self.features, self.masks)
+            vector_output = vector(self.features, self.masks)
+        torch.testing.assert_close(scalar_output, vector_output, rtol=0, atol=0)
+        scalar_output.square().mean().backward()
+        vector_output.square().mean().backward()
+        for (name, parameter), (other_name, other) in zip(scalar.named_parameters(), vector.named_parameters()):
+            self.assertEqual(name, other_name)
+            if parameter.grad is not None:
+                torch.testing.assert_close(parameter.grad.reshape(-1), other.grad.reshape(-1), rtol=0, atol=0)
 
     def test_mode_switches_keep_checkpoint_shapes_and_expected_paths(self):
         both = ExpertMaskFusion(6, 2, self.config)

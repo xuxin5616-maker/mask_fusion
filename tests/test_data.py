@@ -14,7 +14,7 @@ from PIL import Image
 
 from mask_fusion.data import (
     IGNORE_INDEX, IMAGE_TOKEN_INDEX, QADataset, build_prompt, collate_samples,
-    normalize_record, read_records, tokenize_record,
+    normalize_data_paths, normalize_record, read_records, tokenize_record,
 )
 
 
@@ -161,6 +161,123 @@ class DatasetTests(unittest.TestCase):
         np.testing.assert_array_equal(prepare.call_args.args[1], np.arange(24, dtype=np.float32).reshape(4, 6))
         self.assertEqual(sample["images"].shape, (2, 3, 8, 8))
         self.assertIs(sample["mask_valid"], prepared["mask_valid"])
+
+
+class MultiManifestTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        first, second = self.root / "first", self.root / "second"
+        first.mkdir()
+        second.mkdir()
+        Image.new("RGB", (6, 4), (20, 20, 20)).save(first / "image.png")
+        Image.new("RGB", (4, 8), (60, 60, 60)).save(second / "image.png")
+        np.save(first / "mask.npy", np.full((4, 6), 1.25, dtype=np.float32))
+        np.save(second / "mask.npy", np.full((8, 4), 8.5, dtype=np.float32))
+        self.first = first / "train.jsonl"
+        self.second = second / "train.json"
+        self.first_records = [
+            example(id="shared", image="image.png", mask="mask.npy", question="First question?", source_file="user field", source_index="also user field"),
+            example(id="first_2", image="image.png", mask="mask.npy", question="Second question?"),
+        ]
+        self.second_record = example(id="shared", image="image.png", mask="mask.npy", question="Third question?")
+        self.first.write_text("\n".join(json.dumps(record) for record in self.first_records), encoding="utf-8")
+        self.second.write_text(json.dumps([self.second_record]), encoding="utf-8")
+
+    def dataset(self, paths=None, **kwargs):
+        return QADataset(
+            paths if paths is not None else [self.first, self.second],
+            FakeTokenizer(), SimpleNamespace(), SimpleNamespace(), **kwargs,
+        )
+
+    def test_mixed_json_jsonl_preserves_order_local_ids_and_user_metadata(self):
+        dataset = self.dataset()
+        self.assertEqual(len(dataset), 3)
+        self.assertEqual([record["id"] for record in dataset.records], ["shared", "first_2", "shared"])
+        self.assertEqual([record["question"] for record in dataset.records], ["First question?", "Second question?", "Third question?"])
+        self.assertEqual(dataset.records[0]["source_file"], "user field")
+        self.assertEqual(dataset.records[0]["source_index"], "also user field")
+        self.assertEqual(dataset.sources, [
+            {"source_file": str(self.first.resolve()), "source_index": 0},
+            {"source_file": str(self.first.resolve()), "source_index": 1},
+            {"source_file": str(self.second.resolve()), "source_index": 0},
+        ])
+        reversed_dataset = self.dataset([self.second, self.first])
+        self.assertEqual([record["question"] for record in reversed_dataset.records], ["Third question?", "First question?", "Second question?"])
+
+    def test_relative_media_paths_follow_each_manifest_unless_overridden(self):
+        dataset = self.dataset()
+        self.assertEqual(dataset.records[0]["image"], str((self.first.parent / "image.png").resolve()))
+        self.assertEqual(dataset.records[2]["image"], str((self.second.parent / "image.png").resolve()))
+        overridden = self.dataset(data_root=self.first.parent)
+        self.assertEqual({record["image"] for record in overridden.records}, {str((self.first.parent / "image.png").resolve())})
+        self.assertEqual({record["mask"] for record in overridden.records}, {str((self.first.parent / "mask.npy").resolve())})
+
+    def test_duplicate_ids_within_one_file_still_include_source_and_position(self):
+        self.second.write_text(json.dumps([self.second_record, self.second_record]), encoding="utf-8")
+        with self.assertRaises(ValueError) as error:
+            self.dataset()
+        self.assertIn(str(self.second.resolve()), str(error.exception))
+        self.assertIn("record 1", str(error.exception))
+        self.assertIn("duplicate record id", str(error.exception))
+
+    def test_manifest_helper_accepts_singletons_and_rejects_empty_or_duplicate_inputs(self):
+        self.assertEqual(normalize_data_paths(str(self.first)), [self.first.resolve()])
+        self.assertEqual(normalize_data_paths((self.second, self.first)), [self.second.resolve(), self.first.resolve()])
+        self.assertEqual(self.dataset([self.first]).data_path, self.first.resolve())
+        self.assertEqual(self.dataset([self.first]).data_root, self.first.parent.resolve())
+        for invalid in ([], (), "", "   ", [self.first, 42], [self.first, str(self.first.resolve())], [self.first, self.first.parent / ".." / "first" / "train.jsonl"]):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                normalize_data_paths(invalid)
+        with self.assertRaisesRegex(ValueError, "Duplicate data manifest"):
+            self.dataset([self.first, self.first])
+
+    def test_invalid_record_and_invalid_array_report_the_source(self):
+        self.second.write_text(json.dumps([{**self.second_record, "answer": "unknown"}]), encoding="utf-8")
+        with self.assertRaises(ValueError) as error:
+            self.dataset()
+        self.assertIn(str(self.second.resolve()), str(error.exception))
+        self.assertIn("record 0", str(error.exception))
+        self.second.write_text("[not valid JSON", encoding="utf-8")
+        with self.assertRaises(ValueError) as error:
+            read_records(self.second)
+        self.assertIn(str(self.second), str(error.exception))
+        self.assertIn(":1:", str(error.exception))
+
+    @patch("mask_fusion.data._image_tokenize", side_effect=fake_image_tokenize)
+    def test_getitem_uses_each_sources_actual_image_and_continuous_mask(self, _):
+        class Processor:
+            size = (14, 14)
+            crop_size = {"width": 14, "height": 14}
+
+            def preprocess(self, images, return_tensors):
+                if isinstance(images, Image.Image):
+                    images = [images]
+                arrays = [np.asarray(image.resize(self.size), dtype=np.float32).copy() for image in images]
+                return {"pixel_values": torch.from_numpy(np.stack(arrays)).permute(0, 3, 1, 2)}
+
+        dataset = QADataset([self.first, self.second], FakeTokenizer(), Processor(), SimpleNamespace(), mode="square")
+        first, second = dataset[0], dataset[2]
+        self.assertEqual(first["image_size"], (6, 4))
+        self.assertEqual(second["image_size"], (4, 8))
+        self.assertTrue(torch.all(first["images"] == 20))
+        self.assertTrue(torch.all(second["images"] == 60))
+        self.assertTrue(torch.all(first["masks"] == 1.25))
+        self.assertTrue(torch.all(second["masks"] == 8.5))
+        self.assertTrue(first["mask_valid"].all())
+        self.assertTrue(second["mask_valid"].all())
+        self.assertEqual(first["labels"][first["labels"] != IGNORE_INDEX].tolist(), [ord("B") + 10, 2])
+
+    @patch("mask_fusion.data._image_tokenize", side_effect=fake_image_tokenize)
+    def test_lazy_mask_error_has_local_source_position(self, _):
+        dataset = self.dataset()
+        np.save(self.second.parent / "mask.npy", np.array([[np.nan]], dtype=np.float32))
+        with self.assertRaises(ValueError) as error:
+            dataset[2]
+        self.assertIn(str(self.second.resolve()), str(error.exception))
+        self.assertIn("record 0", str(error.exception))
+        self.assertIn("finite", str(error.exception))
 
 
 class CollationTests(unittest.TestCase):

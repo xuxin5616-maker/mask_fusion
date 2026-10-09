@@ -4,4 +4,7 @@ __pycache__/
 .pytest_cache/
 outputs/
 checkpoints/
+runs/
+results/
+.fsdp-smoke-*/
 *.egg-info/

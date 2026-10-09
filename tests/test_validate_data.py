@@ -129,6 +129,111 @@ class ValidateDataTests(unittest.TestCase):
         report = validate_splits(path, data_root=self.root)
         self.assertEqual(report["splits"]["train"]["data_root"], str(self.root.resolve()))
 
+    def test_multiple_manifests_merge_counts_with_source_local_ids(self):
+        first = self.write("first.jsonl", [self.record(), self.record(2, identifier="q2")])
+        second = self.root / "second.json"
+        second.write_text(json.dumps([
+            self.record(identifier="q1", image="./image1.png", options=None, answer="No damage."),
+            self.record(3, "cable", "q2"),
+        ]), encoding="utf-8")
+        with patch("mask_fusion.preprocessing.load_mask", wraps=load_mask) as load:
+            report = validate_splits([str(first), second], check_pixels=True)
+        self.assertEqual(load.call_count, 3)
+        self.assertEqual(report["total"], {"qa_count": 4, "unique_images": 3, "unique_masks": 3, "category_count": 2})
+        split = report["splits"]["train"]
+        self.assertEqual(split["manifests"], [str(first.resolve()), str(second.resolve())])
+        self.assertIsNone(split["manifest"])
+        self.assertEqual(split["data_root"], str(self.root.resolve()))
+        self.assertEqual(split["per_category"]["bottle"], {"qa_count": 3, "unique_images": 2})
+        self.assertEqual((split["mcq_count"], split["free_text_count"]), (3, 1))
+        self.assertEqual([source["qa_count"] for source in split["sources"]], [2, 2])
+        self.assertEqual([source["unique_images"] for source in split["sources"]], [2, 2])
+        self.assertEqual(split["sources"][1]["free_text_count"], 1)
+        single = validate_splits(str(first))["splits"]["train"]
+        self.assertEqual(single["manifest"], str(first.resolve()))
+        self.assertEqual(single["data_root"], str(self.root.resolve()))
+        self.assertEqual(single["manifests"], [str(first.resolve())])
+        json.dumps(report)
+
+    def test_multiple_source_directories_resolve_paths_independently(self):
+        manifests = []
+        for name in ("left", "right"):
+            manifest = self.write(f"{name}/train.jsonl", [self.record()])
+            for filename in ("image1.png", "mask1.npy"):
+                (manifest.parent / filename).write_bytes((self.root / filename).read_bytes())
+            manifests.append(manifest)
+        report = validate_splits(manifests, check_pixels=True)
+        self.assertEqual(report["total"]["unique_images"], 2)
+        self.assertEqual(report["total"]["unique_masks"], 2)
+        split = report["splits"]["train"]
+        self.assertIsNone(split["data_root"])
+        self.assertEqual([source["data_root"] for source in split["sources"]],
+                         [str(path.parent.resolve()) for path in manifests])
+        override = validate_splits(manifests, data_root=self.root, check_pixels=True)
+        self.assertEqual(override["total"]["unique_images"], 1)
+        self.assertEqual(override["checked_mask_count"], 1)
+        self.assertEqual(override["splits"]["train"]["data_root"], str(self.root.resolve()))
+        self.assertTrue(all(source["data_root"] == str(self.root.resolve())
+                            for source in override["splits"]["train"]["sources"]))
+
+    def test_image_leakage_from_later_sources_is_rejected(self):
+        first = self.write("train_a.jsonl", [self.record(1)])
+        second = self.write("train_b.jsonl", [self.record(2, "cable")])
+        val_first = self.write("val_a.jsonl", [self.record(3, "capsule")])
+        val_second = self.write("val_b.jsonl", [self.record(2, "cable", image="./image2.png")])
+        with self.assertRaisesRegex(ValueError, "val_b.jsonl.*Image leakage"):
+            validate_splits([first, second], [val_first, val_second], allow_shared_categories=True)
+
+    def test_category_overlap_from_later_sources_is_rejected_or_reported(self):
+        first = self.write("train_a.jsonl", [self.record(1)])
+        second = self.write("train_b.jsonl", [self.record(2, "cable")])
+        test = self.write("test.jsonl", [self.record(3, "cable")])
+        with self.assertRaisesRegex(ValueError, "Category overlap.*cable"):
+            validate_splits([first, second], test=[test])
+        report = validate_splits([first, second], test=[test], allow_shared_categories=True)
+        self.assertEqual(report["shared_categories"], {"cable": ["test", "train"]})
+
+    def test_same_image_category_conflict_across_source_files_is_rejected(self):
+        first = self.write("first.jsonl", [self.record()])
+        second = self.write("second.jsonl", [self.record(category="cable", image="./image1.png")])
+        with self.assertRaisesRegex(ValueError, "second.jsonl.*conflicting category"):
+            validate_splits([first, second], allow_shared_categories=True)
+
+    def test_duplicate_ids_within_later_source_are_still_rejected(self):
+        first = self.write("first.jsonl", [self.record(identifier="q1")])
+        second = self.write("second.jsonl", [self.record(2, identifier="q1"), self.record(3, identifier="q1")])
+        with self.assertRaisesRegex(ValueError, "second.jsonl: record 2: Duplicate id"):
+            validate_splits([first, second])
+
+    def test_duplicate_resolved_manifests_are_rejected_within_and_across_splits(self):
+        path = self.write("train.jsonl", [self.record()])
+        alias = path.parent / "unused" / ".." / path.name
+        with self.assertRaisesRegex(ValueError, "[Dd]uplicate.*[Mm]anifest|[Dd]uplicate.*[Dd]ata"):
+            validate_splits([path, alias])
+        with self.assertRaisesRegex(ValueError, "Duplicate resolved manifest.*val.*train"):
+            validate_splits([path], val=[alias], allow_shared_categories=True)
+        with self.assertRaises(ValueError):
+            validate_splits([])
+
+    def test_cli_accepts_multiple_files_and_repeated_split_options(self):
+        train = [self.write(f"train_{number}.jsonl", [self.record()]) for number in range(3)]
+        val = [self.write(f"val_{number}.jsonl", [self.record(2, "capsule")]) for number in range(2)]
+        test = [self.write(f"test_{number}.jsonl", [self.record(3, "cable")]) for number in range(2)]
+        output = io.StringIO()
+        with redirect_stdout(output):
+            status = main([
+                "--train", str(train[0]), str(train[1]), "--train", str(train[2]),
+                "--val", str(val[0]), "--val", str(val[1]),
+                "--test", *(str(path) for path in test), "--check-pixels",
+            ])
+        self.assertEqual(status, 0, output.getvalue())
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["total"]["qa_count"], 7)
+        self.assertEqual(report["total"]["unique_images"], 3)
+        self.assertEqual(report["checked_mask_count"], 3)
+        self.assertEqual(report["splits"]["train"]["manifests"], [str(path.resolve()) for path in train])
+        self.assertEqual([report["splits"][split]["qa_count"] for split in ("train", "val", "test")], [3, 2, 2])
+
     def test_pixel_checks_are_opt_in_and_reject_invalid_raw_scores(self):
         path = self.write("train.jsonl", [self.record()])
         for values, expected in [

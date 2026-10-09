@@ -149,7 +149,9 @@ class PriorAttentionLayer(nn.Module):
         attended = attended.transpose(1, 2).reshape(batch, length, -1)
         delta = self.out_proj(attended)
         delta = delta.masked_fill(~valid_tokens.unsqueeze(-1), 0.0)
-        return features + self.alpha * delta
+        # FSDP stores this scalar as shape [1]. Keep scalar type-promotion
+        # semantics under BF16 autocast identical to single-device execution.
+        return features + self.alpha.reshape(()) * delta
 
 
 class ExpertMaskFusion(nn.Module):

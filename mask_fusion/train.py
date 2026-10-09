@@ -1,4 +1,4 @@
-"""Single-device supervised training with adapter-only, resumable checkpoints."""
+"""Single-device or torchrun/FSDP training with resumable adapter checkpoints."""
 from __future__ import annotations
 
 import argparse
@@ -6,27 +6,28 @@ import hashlib
 import json
 import math
 import random
+import os
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from .data import QADataset, collate_samples
+from .data import QADataset, collate_samples, normalize_data_paths
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-model", required=True, help="Local LLaVA-OneVision Qwen2 checkpoint")
-    parser.add_argument("--data", required=True, help="Training JSONL or JSON array")
+    parser.add_argument("--data", required=True, nargs="+", action="extend", metavar="FILE", help="One or more training JSONL/JSON files; may repeat --data")
     parser.add_argument("--output", required=True)
     parser.add_argument("--fusion-config", help="Optional fusion configuration JSON")
     parser.add_argument("--vision-tower", help="Optional local SigLIP directory overriding the checkpoint's vision tower path")
     parser.add_argument("--image-mode", default="anyres_max_9")
     parser.add_argument("--data-root", help="Root for relative image and mask paths; otherwise the JSON directory")
-    parser.add_argument("--val-data", "--validation", dest="val_data", help="Optional held-out QA dataset")
+    parser.add_argument("--val-data", "--validation", dest="val_data", nargs="+", action="extend", metavar="FILE", help="One or more held-out QA JSONL/JSON files")
     parser.add_argument("--val-data-root")
     parser.add_argument("--require-disjoint-categories", action="store_true", help="Require category annotations and no train/validation category overlap")
     parser.add_argument("--lr", type=float, default=1e-4, help="New fusion module learning rate")
@@ -40,6 +41,7 @@ def parse_args(argv=None):
     parser.add_argument("--max-text-length", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--distributed", choices=("none", "fsdp"), default="none", help="fsdp requires torchrun with multiple CUDA processes and uses FULL_SHARD")
     parser.add_argument("--dtype", choices=("auto", "bfloat16", "float16", "float32"), default="auto")
     parser.add_argument("--attn-implementation", default="sdpa")
     parser.add_argument("--num-workers", type=int, default=0)
@@ -59,15 +61,24 @@ def parse_args(argv=None):
         parser.error("warmup-ratio must be in [0, 1), and weight-decay must be nonnegative")
     if args.require_disjoint_categories and not args.val_data:
         parser.error("--require-disjoint-categories requires --val-data")
+    # Preserve the existing single-file argument/metadata representation.
+    # Multi-file order is meaningful for deterministic shuffle and resume.
+    for name in ("data", "val_data"):
+        values = getattr(args, name)
+        if values is not None and len(values) == 1:
+            setattr(args, name, values[0])
     return args
 
 
-def _seed_everything(seed: int):
+def _seed_everything(seed: int, context=None):
     random.seed(seed)
     np.random.seed(seed % (2**32))
-    torch.manual_seed(seed)
+    torch.random.default_generator.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        if context is not None:
+            torch.cuda.manual_seed(seed)
+        else:
+            torch.cuda.manual_seed_all(seed)
 
 
 def _move(value: Any, device: torch.device):
@@ -100,14 +111,17 @@ def _resolve_dtype(name: str, device: torch.device):
     return name, getattr(torch, name)
 
 
-def _fingerprint(path: Optional[str]):
+def _fingerprint(path):
+    """Fingerprint every manifest in order, retaining legacy single-file state."""
     if path is None:
         return None
-    path = Path(path).resolve()
-    return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    paths = normalize_data_paths(path)
+    result = [{"path": str(source), "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+              for source in paths]
+    return result[0] if len(result) == 1 else result
 
 
-def _run_signature(args, dataset_size: int, total_steps: int, dtype_name: str):
+def _run_signature(args, dataset_size: int, total_steps: int, dtype_name: str, context=None):
     return {
         "base_model": str(Path(args.base_model).resolve()),
         "train_data": _fingerprint(args.data), "val_data": _fingerprint(args.val_data),
@@ -123,22 +137,103 @@ def _run_signature(args, dataset_size: int, total_steps: int, dtype_name: str):
         "max_text_length": args.max_text_length, "dataset_size": dataset_size,
         "total_steps": total_steps, "dtype": dtype_name,
         "gradient_checkpointing": not args.no_gradient_checkpointing,
+        "distributed": args.distributed, "world_size": context.world_size if context else 1,
     }
 
 
-def _rng_state():
+def _rng_state(context=None):
+    if context is not None:
+        return {
+            "python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state(),
+            # Access only this process's CUDA device; never initialize all visible GPUs.
+            "cuda_local": torch.cuda.get_rng_state(context.device),
+        }
     return {
         "python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state(),
         "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
     }
 
 
-def _restore_rng(state):
+def _restore_rng(state, context=None):
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
     torch.set_rng_state(state["torch"])
-    if state["cuda"] is not None and torch.cuda.is_available():
+    if "cuda_local" in state:
+        if context is None:
+            raise ValueError("A distributed RNG state requires its rank context")
+        torch.cuda.set_rng_state(state["cuda_local"], context.device)
+    elif state["cuda"] is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _rank_zero_print(payload, context=None):
+    if context is None or context.is_main:
+        print(json.dumps(payload), flush=True)
+
+
+def _rank_zero_action(action, context=None):
+    """Run shared-filesystem writes once and propagate failures to every rank."""
+    if context is None:
+        return action()
+    status = [None]
+    if context.is_main:
+        try:
+            action()
+        except Exception as error:
+            status[0] = f"{type(error).__name__}: {error}"
+    torch.distributed.broadcast_object_list(status, src=0)
+    if status[0] is not None:
+        raise RuntimeError(f"Rank 0 operation failed: {status[0]}")
+
+
+def _all_ranks_true(value, context=None):
+    if context is None:
+        return bool(value)
+    flag = torch.tensor(int(bool(value)), device=context.device, dtype=torch.int32)
+    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+    return bool(flag.item())
+
+
+def _mean_across_ranks(value, context=None):
+    if context is None:
+        return float(value)
+    total = torch.tensor(float(value), device=context.device, dtype=torch.float64)
+    torch.distributed.all_reduce(total, op=torch.distributed.ReduceOp.SUM)
+    return float(total.item()) / context.world_size
+
+
+def _distributed_indices(size, *, rank=0, world_size=1, seed=0, shuffle=True):
+    """Equal-length rank shards; mark repeated padding for unbiased validation.
+
+    Like DistributedSampler(drop_last=False), training repeats at most world-1
+    examples. Even a dataset smaller than world_size gives every rank a batch.
+    """
+    if size < 1 or world_size < 1 or not 0 <= rank < world_size:
+        raise ValueError("Invalid dataset size or distributed rank/world size")
+    order = torch.randperm(size, generator=torch.Generator().manual_seed(seed)).tolist() if shuffle else list(range(size))
+    total_size = math.ceil(size / world_size) * world_size
+    padded = (order * math.ceil(total_size / size))[:total_size]
+    valid = [index < size for index in range(total_size)]
+    return padded[rank:total_size:world_size], valid[rank:total_size:world_size]
+
+
+def _load_resume_state(path, context=None):
+    """Only rank 0 reads the full optimizer state; broadcast small run metadata."""
+    if context is None:
+        state = _load_training_state(path)
+        return state, state["optimizer"]
+    payload, optimizer_state = [None, None], None
+    if context.is_main:
+        try:
+            state = _load_training_state(path)
+            optimizer_state = state.pop("optimizer")
+            payload[1] = state
+        except Exception as error:
+            payload[0] = f"{type(error).__name__}: {error}"
+    torch.distributed.broadcast_object_list(payload, src=0)
+    if payload[0] is not None:
+        raise RuntimeError(f"Could not read checkpoint on rank 0: {payload[0]}")
+    return payload[1], optimizer_state
 
 
 def _load_training_state(path: Path):
@@ -150,40 +245,59 @@ def _load_training_state(path: Path):
         return torch.load(path, map_location="cpu")
 
 
-def _save_checkpoint(model, tokenizer, output, args, optimizer, scheduler, scaler, signature, *, epoch, next_batch, global_step, best_val_loss, consecutive_overflows=0):
+def _save_checkpoint(model, tokenizer, output, args, optimizer, scheduler, scaler, signature, *, epoch, next_batch, global_step, best_val_loss, consecutive_overflows=0, context=None):
     from .model import save_adapter
 
     output = Path(output)
-    output.mkdir(parents=True, exist_ok=True)
-    # A previous "best" or final checkpoint must not retain a stale completion
-    # marker while its adapter weights are being replaced.
-    completion = output / "training_state.pt"
-    if completion.exists():
-        completion.unlink()
-    save_adapter(model, output, args.base_model, tokenizer=tokenizer)
+    weights = None
+    base_model = model
+    if context is not None:
+        from .distributed import collect_adapter_state, collect_optimizer_state, gather_rank_rng, unwrap_model
+
+        # All ranks enter these collectives, including ranks that do not write.
+        weights = collect_adapter_state(model)
+        optimizer_state = collect_optimizer_state(model, optimizer)
+        rng = gather_rank_rng(_rng_state(context))
+        base_model = unwrap_model(model)
+    else:
+        optimizer_state = optimizer.state_dict()
+        rng = _rng_state()
     state = {
         "format_version": 1, "signature": signature, "epoch": epoch,
         "next_batch": next_batch, "global_step": global_step, "best_val_loss": best_val_loss,
         "consecutive_overflows": consecutive_overflows,
-        "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
-        "scaler": scaler.state_dict(), "rng": _rng_state(),
+        "optimizer": optimizer_state, "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(), "rng": rng,
     }
-    # This file is the completion marker; adapters without it cannot be resumed.
-    temporary = output / "training_state.pt.tmp"
-    torch.save(state, temporary)
-    temporary.replace(completion)
+
+    def write_checkpoint():
+        output.mkdir(parents=True, exist_ok=True)
+        completion = output / "training_state.pt"
+        if completion.exists():
+            completion.unlink()
+        if context is None:
+            save_adapter(base_model, output, args.base_model, tokenizer=tokenizer)
+        else:
+            save_adapter(base_model, output, args.base_model, tokenizer=tokenizer, weights=weights)
+        # The atomically replaced state is the checkpoint completion marker.
+        temporary = output / "training_state.pt.tmp"
+        torch.save(state, temporary)
+        temporary.replace(completion)
+
+    _rank_zero_action(write_checkpoint, context)
 
 
-def _optimizer_update(optimizer, scheduler, scaler, parameters, max_grad_norm):
+def _optimizer_update(optimizer, scheduler, scaler, parameters, max_grad_norm, *, model=None, context=None):
     """Let FP16 GradScaler skip overflowing updates and reduce its loss scale."""
     scaler.unscale_(optimizer)
-    grad_norm = torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm)
+    # FSDP owns gradient shards; a local clip would compute the wrong norm.
+    grad_norm = model.clip_grad_norm_(max_grad_norm) if context is not None else torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm)
     if not torch.isfinite(grad_norm):
         if not scaler.is_enabled():
             raise RuntimeError("Nonfinite gradients; no optimizer step was taken")
         # GradScaler detects inf/nan entries while unscaling. An overflowing norm
         # of finite entries is a separate error, not a scaler-detected overflow.
-        if all(torch.isfinite(parameter.grad).all() for parameter in parameters if parameter.grad is not None):
+        if _all_ranks_true(all(torch.isfinite(parameter.grad).all() for parameter in parameters if parameter.grad is not None), context):
             raise RuntimeError("Nonfinite gradient norm despite finite entries; no optimizer step was taken")
     scale_before = scaler.get_scale()
     scaler.step(optimizer)  # skips internally when unscale_ found nonfinite values
@@ -205,20 +319,36 @@ def _loader(dataset, indices, args, pad_token_id, epoch):
     )
 
 
-def evaluate(model, dataset, args, pad_token_id, device, dtype):
+def evaluate(model, dataset, args, pad_token_id, device, dtype, context=None):
     model.eval()
     loss_sum, token_count = 0.0, 0
-    loader = _loader(dataset, list(range(len(dataset))), args, pad_token_id, 0)
+    indices, valid_samples = _distributed_indices(
+        len(dataset), rank=context.rank if context else 0,
+        world_size=context.world_size if context else 1, shuffle=False,
+    )
+    loader = _loader(dataset, indices, args, pad_token_id, 0)
     with torch.no_grad():
-        for batch in loader:
+        for batch_index, batch in enumerate(loader):
             batch = _move(batch, device)
-            count = int((batch["labels"] != -100).sum().item())
+            valid = torch.tensor(valid_samples[batch_index * args.batch_size : (batch_index + 1) * args.batch_size], device=device, dtype=torch.bool)
+            counted_labels = batch["labels"].clone()
+            counted_labels[~valid] = -100
+            count = int((counted_labels != -100).sum().item())
+            # Every rank must execute equally many FSDP forwards. For a rank's
+            # all-padding batch, retain dummy labels to avoid all-ignored NaN,
+            # then assign zero statistical weight to that forward.
+            if count:
+                batch["labels"] = counted_labels
             with _autocast(device, dtype):
                 loss = model(**batch).loss
-            if not torch.isfinite(loss):
+            if not _all_ranks_true(torch.isfinite(loss), context):
                 raise RuntimeError("Nonfinite validation loss")
             loss_sum += float(loss.item()) * count
             token_count += count
+    if context is not None:
+        totals = torch.tensor([loss_sum, token_count], device=device, dtype=torch.float64)
+        torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
+        loss_sum, token_count = totals.tolist()
     if token_count == 0:
         raise ValueError("Validation dataset has no supervised answer tokens")
     return loss_sum / token_count
@@ -226,6 +356,25 @@ def evaluate(model, dataset, args, pad_token_id, device, dtype):
 
 def main(argv=None):
     args = parse_args(argv)
+    # argparse exits for --help before CUDA checks or collective initialization.
+    context = None
+    if args.distributed == "fsdp":
+        if torch.device(args.device).type != "cuda":
+            raise ValueError("--distributed fsdp requires CUDA; use torchrun --nproc_per_node=2")
+        from .distributed import initialize_distributed
+
+        context = initialize_distributed()
+        args.device = str(context.device)
+    elif int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        raise ValueError("torchrun multi-process training requires --distributed fsdp; otherwise processes would overwrite one output")
+    try:
+        _run_training(args, context)
+    finally:
+        if context is not None and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+
+def _run_training(args, context=None):
     from .model import configure_trainable, load_model
 
     device = torch.device(args.device)
@@ -235,10 +384,14 @@ def main(argv=None):
         if device.index is not None:
             torch.cuda.set_device(device.index)
     dtype_name, dtype = _resolve_dtype(args.dtype, device)
-    _seed_everything(args.seed)
+    _seed_everything(args.seed, context)
     output = Path(args.output).resolve()
-    if output.exists() and any(output.iterdir()) and not args.resume:
-        raise ValueError(f"Output directory is not empty: {output}; choose a new directory or explicitly use --resume")
+
+    def check_output():
+        if output.exists() and any(output.iterdir()) and not args.resume:
+            raise ValueError(f"Output directory is not empty: {output}; choose a new directory or explicitly use --resume")
+
+    _rank_zero_action(check_output, context)
     fusion_config = None
     if args.fusion_config:
         with open(args.fusion_config, "r", encoding="utf-8-sig") as handle:
@@ -246,11 +399,13 @@ def main(argv=None):
         if not isinstance(fusion_config, dict):
             raise ValueError("fusion-config must contain a JSON object")
     # Resume explicitly reloads trainable weights as well as optimizer and RNG.
-    resume_state = _load_training_state(Path(args.resume) / "training_state.pt") if args.resume else None
+    resume_state, resume_optimizer = _load_resume_state(Path(args.resume) / "training_state.pt", context) if args.resume else (None, None)
+    deferred = {"defer_device": True} if context is not None else {}
     model, tokenizer, processor = load_model(
         args.base_model, fusion_config=fusion_config, adapter_path=args.resume,
         image_mode=args.image_mode, device=str(device), dtype=dtype_name,
         attn_implementation=args.attn_implementation, vision_tower=args.vision_tower,
+        **deferred,
     )
     configure_trainable(model)
     model.config.use_cache = False
@@ -281,6 +436,15 @@ def main(argv=None):
             if overlap:
                 raise ValueError(f"Training/validation categories overlap: {', '.join(sorted(overlap))}")
 
+    # Save the original global count before parameters become local FSDP shards.
+    trainable_parameter_count = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    original_model = model
+    if context is not None:
+        from .distributed import wrap_model
+
+        model = wrap_model(model, device=device, dtype=dtype)
+        # Initialization is common across ranks; stochastic training is rank-local.
+        _seed_everything(args.seed + context.rank, context)
     groups = {"fusion": [], "projector": []}
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
@@ -300,7 +464,8 @@ def main(argv=None):
         [{"params": groups["fusion"], "lr": args.lr}, {"params": groups["projector"], "lr": args.projector_lr}],
         weight_decay=args.weight_decay,
     )
-    batches_per_epoch = math.ceil(len(dataset) / args.batch_size)
+    samples_per_rank = math.ceil(len(dataset) / (context.world_size if context else 1))
+    batches_per_epoch = math.ceil(samples_per_rank / args.batch_size)
     total_steps = math.ceil(batches_per_epoch / args.grad_accum) * args.epochs
     warmup_steps = int(total_steps * args.warmup_ratio)
 
@@ -311,18 +476,33 @@ def main(argv=None):
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_multiplier)
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda" and dtype == torch.float16)
-    signature = _run_signature(args, len(dataset), total_steps, dtype_name)
+    if context is not None:
+        from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
+
+        scaler = ShardedGradScaler(enabled=dtype == torch.float16)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda" and dtype == torch.float16)
+    signature = _run_signature(args, len(dataset), total_steps, dtype_name, context)
     start_epoch, start_batch, global_step = 0, 0, 0
     best_val_loss = float("inf")
     consecutive_overflows = 0
     if resume_state is not None:
         if resume_state.get("format_version") != 1:
             raise ValueError("Unsupported training checkpoint format")
-        if resume_state["signature"] != signature:
-            differences = [key for key in signature if signature[key] != resume_state["signature"].get(key)]
+        saved_signature = dict(resume_state["signature"])
+        saved_signature.setdefault("distributed", "none")
+        saved_signature.setdefault("world_size", 1)
+        if saved_signature != signature:
+            differences = [key for key in signature if signature[key] != saved_signature.get(key)]
             raise ValueError(f"Resume settings/data differ from checkpoint: {', '.join(differences)}")
-        optimizer.load_state_dict(resume_state["optimizer"])
+        if context is not None:
+            from .distributed import restore_optimizer_state
+
+            restore_optimizer_state(model, optimizer, resume_optimizer)
+        else:
+            optimizer.load_state_dict(resume_optimizer)
+        resume_state.pop("optimizer", None)
+        del resume_optimizer
         scheduler.load_state_dict(resume_state["scheduler"])
         scaler.load_state_dict(resume_state["scaler"])
         start_epoch, start_batch = int(resume_state["epoch"]), int(resume_state["next_batch"])
@@ -332,21 +512,28 @@ def main(argv=None):
             raise ValueError("Invalid checkpoint epoch/batch cursor")
         if start_batch % args.grad_accum != 0:
             raise ValueError("Checkpoint is not at a gradient-accumulation boundary")
-        _restore_rng(resume_state["rng"])
+        if context is not None:
+            from .distributed import rank_rng
 
-    output.mkdir(parents=True, exist_ok=True)
-    with (output / "training_args.json").open("w", encoding="utf-8") as handle:
-        json.dump(vars(args), handle, indent=2, ensure_ascii=False)
-    print(json.dumps({"event": "train_start", "qa_records": len(dataset), "unique_images": len({r['image'] for r in dataset.records}), "trainable_parameters": sum(p.numel() for p in trainable), "total_steps": total_steps, "resume_step": global_step, "dtype": dtype_name}), flush=True)
+            _restore_rng(rank_rng(resume_state["rng"]), context)
+        else:
+            _restore_rng(resume_state["rng"])
+
+    def write_args():
+        output.mkdir(parents=True, exist_ok=True)
+        with (output / "training_args.json").open("w", encoding="utf-8") as handle:
+            json.dump(vars(args), handle, indent=2, ensure_ascii=False)
+
+    _rank_zero_action(write_args, context)
+    _rank_zero_print({"event": "train_start", "qa_records": len(dataset), "unique_images": len({r['image'] for r in dataset.records}), "trainable_parameters": trainable_parameter_count, "total_steps": total_steps, "resume_step": global_step, "dtype": dtype_name, "distributed": args.distributed, "world_size": context.world_size if context else 1, "effective_batch_size": args.batch_size * args.grad_accum * (context.world_size if context else 1), "repeated_samples_per_epoch": samples_per_rank * (context.world_size if context else 1) - len(dataset)}, context)
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(start_epoch, args.epochs):
         dataset.set_epoch(epoch)
-        generator = torch.Generator().manual_seed(args.seed + epoch)
-        order = torch.randperm(len(dataset), generator=generator).tolist()
+        order, _ = _distributed_indices(len(dataset), rank=context.rank if context else 0, world_size=context.world_size if context else 1, seed=args.seed + epoch)
         cursor = start_batch if epoch == start_epoch else 0
         loader = _loader(dataset, order[cursor * args.batch_size :], args, tokenizer.pad_token_id, epoch)
         model.train()
-        model.get_vision_tower().eval()
+        original_model.get_vision_tower().eval()
         group_loss = 0.0
         group_start = cursor
         group_size = min(args.grad_accum, batches_per_epoch - group_start)
@@ -354,7 +541,7 @@ def main(argv=None):
             batch = _move(batch, device)
             with _autocast(device, dtype):
                 loss = model(**batch).loss
-            if not torch.isfinite(loss):
+            if not _all_ranks_true(torch.isfinite(loss), context):
                 raise RuntimeError(f"Nonfinite training loss at epoch={epoch}, batch={batch_index}")
             group_loss += float(loss.detach().item())
             # The last, possibly incomplete accumulation group has its own denominator.
@@ -363,7 +550,7 @@ def main(argv=None):
             if not boundary:
                 continue
             updated, grad_norm, scale_before, scale_after = _optimizer_update(
-                optimizer, scheduler, scaler, trainable, args.max_grad_norm,
+                optimizer, scheduler, scaler, trainable, args.max_grad_norm, model=model, context=context,
             )
             optimizer.zero_grad(set_to_none=True)
             if updated:
@@ -371,27 +558,28 @@ def main(argv=None):
                 consecutive_overflows = 0
             else:
                 consecutive_overflows += 1
-                print(json.dumps({"event": "optimizer_step_skipped", "reason": "fp16_gradient_overflow", "epoch": epoch + 1, "next_batch": batch_index + 1, "step": global_step, "loss_scale_before": scale_before, "loss_scale_after": scale_after, "consecutive_overflows": consecutive_overflows}), flush=True)
+                _rank_zero_print({"event": "optimizer_step_skipped", "reason": "fp16_gradient_overflow", "epoch": epoch + 1, "next_batch": batch_index + 1, "step": global_step, "loss_scale_before": scale_before, "loss_scale_after": scale_after, "consecutive_overflows": consecutive_overflows}, context)
                 if consecutive_overflows >= 32:
                     raise RuntimeError("32 consecutive FP16 gradient overflows prevented optimizer updates; use bfloat16/float32 or inspect the numerical instability")
             if updated and (global_step % args.log_every == 0 or global_step == 1):
-                print(json.dumps({"event": "train_step", "epoch": epoch + 1, "step": global_step, "loss": group_loss / group_size, "grad_norm": float(grad_norm), "fusion_lr": optimizer.param_groups[0]["lr"], "projector_lr": optimizer.param_groups[1]["lr"]}), flush=True)
+                mean_loss = _mean_across_ranks(group_loss / group_size, context)
+                _rank_zero_print({"event": "train_step", "epoch": epoch + 1, "step": global_step, "loss": mean_loss, "grad_norm": float(grad_norm), "fusion_lr": optimizer.param_groups[0]["lr"], "projector_lr": optimizer.param_groups[1]["lr"]}, context)
             next_batch = batch_index + 1
             if args.save_every_steps and global_step % args.save_every_steps == 0 and next_batch < batches_per_epoch:
-                _save_checkpoint(model, tokenizer, output / f"checkpoint-step-{global_step}", args, optimizer, scheduler, scaler, signature, epoch=epoch, next_batch=next_batch, global_step=global_step, best_val_loss=best_val_loss, consecutive_overflows=consecutive_overflows)
+                _save_checkpoint(model, tokenizer, output / f"checkpoint-step-{global_step}", args, optimizer, scheduler, scaler, signature, epoch=epoch, next_batch=next_batch, global_step=global_step, best_val_loss=best_val_loss, consecutive_overflows=consecutive_overflows, context=context)
             group_start, group_loss = next_batch, 0.0
             group_size = min(args.grad_accum, batches_per_epoch - group_start)
         if validation is not None:
-            val_loss = evaluate(model, validation, args, tokenizer.pad_token_id, device, dtype)
-            print(json.dumps({"event": "validation", "epoch": epoch + 1, "step": global_step, "answer_token_loss": val_loss}), flush=True)
+            val_loss = evaluate(model, validation, args, tokenizer.pad_token_id, device, dtype, context)
+            _rank_zero_print({"event": "validation", "epoch": epoch + 1, "step": global_step, "answer_token_loss": val_loss}, context)
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                _save_checkpoint(model, tokenizer, output / "best", args, optimizer, scheduler, scaler, signature, epoch=epoch + 1, next_batch=0, global_step=global_step, best_val_loss=best_val_loss, consecutive_overflows=consecutive_overflows)
-        _save_checkpoint(model, tokenizer, output / f"checkpoint-epoch-{epoch + 1}", args, optimizer, scheduler, scaler, signature, epoch=epoch + 1, next_batch=0, global_step=global_step, best_val_loss=best_val_loss, consecutive_overflows=consecutive_overflows)
+                _save_checkpoint(model, tokenizer, output / "best", args, optimizer, scheduler, scaler, signature, epoch=epoch + 1, next_batch=0, global_step=global_step, best_val_loss=best_val_loss, consecutive_overflows=consecutive_overflows, context=context)
+        _save_checkpoint(model, tokenizer, output / f"checkpoint-epoch-{epoch + 1}", args, optimizer, scheduler, scaler, signature, epoch=epoch + 1, next_batch=0, global_step=global_step, best_val_loss=best_val_loss, consecutive_overflows=consecutive_overflows, context=context)
     if global_step == 0:
         raise RuntimeError("Training ended without a successful optimizer update; inspect overflow events and select bfloat16/float32")
-    _save_checkpoint(model, tokenizer, output, args, optimizer, scheduler, scaler, signature, epoch=args.epochs, next_batch=0, global_step=global_step, best_val_loss=best_val_loss, consecutive_overflows=consecutive_overflows)
-    print(json.dumps({"event": "train_complete", "output": str(output), "steps": global_step}), flush=True)
+    _save_checkpoint(model, tokenizer, output, args, optimizer, scheduler, scaler, signature, epoch=args.epochs, next_batch=0, global_step=global_step, best_val_loss=best_val_loss, consecutive_overflows=consecutive_overflows, context=context)
+    _rank_zero_print({"event": "train_complete", "output": str(output), "steps": global_step}, context)
 
 
 if __name__ == "__main__":
