@@ -98,6 +98,27 @@ python -m pip install -r requirements.txt
 
 选择题 prompt 明确要求只回答选项字母。SFT 仅监督 assistant 答案和 ChatML 结束 token；system/user、图像和 padding 的标签均为 `-100`。超长文本或图像展开后超出上下文时直接报错，不静默截掉答案。
 
+### 原 LLaVA / Triad 对话格式
+
+训练、推理和数据预检也接受下面这种单轮 `conversations` 记录，无需预先转换 JSON：
+
+```json
+{
+  "id": "sample_001",
+  "image": "images/001.png",
+  "mask": "masks/001.png",
+  "class": "banana_juice",
+  "conversations": [
+    {"from": "human", "value": "Image:\n<image>\nProduction process: ...\nQuestion: Is the product defective?"},
+    {"from": "gpt", "value": "The labels are aligned. Overall, the answer is: No."}
+  ]
+}
+```
+
+`human.value` 转为完整问题上下文，`gpt.value` 转为完整监督答案。输入文本中的一个 `<image>` 标记移除后，由 prompt 构造函数统一插入；生产过程说明和回答正文保留。仅推理时可以只提供一条 `human` 消息。多轮对话、角色顺序错误或多个图像标记会明确报错，不截取第一轮或丢弃后续内容。已有顶层 `question` 的记录继续使用原扁平格式。
+
+类别优先使用 `category`，缺失时依次取 `class`、`sub_dataset`。专家分数图始终读取 `mask`；记录中额外的 `musc_mask`、`muscv2_mask` 不参与选择。没有 `options` 时使用开放式 QA，不会把长回答自动改成选项字母。两种记录格式可以放在同一个文件，也可以使用多个文件混合训练。
+
 ### 多个训练与验证文件
 
 训练的 `--data`、`--val-data` 接受一个或多个文件，JSON 数组与 JSONL 可以混用；也可以重复提供同一个选项。文件按传入顺序合并为一个数据集，训练时统一打乱，不对每个文件单独训练或默认均衡采样。

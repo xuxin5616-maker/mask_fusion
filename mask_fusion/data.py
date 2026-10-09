@@ -34,18 +34,54 @@ def _comparison_text(value: str) -> str:
     return " ".join(value.split()).casefold()
 
 
+def _adapt_conversations(record: Mapping[str, Any], *, require_answer: bool) -> Dict[str, Any]:
+    """Map a single LLaVA human/gpt pair to the shared QA schema.
+
+    Work on a copy and retain source metadata. A record with an explicit
+    question already uses the flat schema (including a previously normalized
+    record), so it is not reinterpreted on subsequent prompt/tokenizer calls.
+    """
+    result = dict(record)
+    if "question" in result or "conversations" not in result:
+        return result
+    turns = result["conversations"]
+    if not isinstance(turns, list) or len(turns) not in (1, 2):
+        raise ValueError(
+            "conversations must contain a single human/gpt pair "
+            "(or one human message for inference); multi-turn conversations are not supported"
+        )
+    for index, turn in enumerate(turns):
+        expected_role = "human" if index == 0 else "gpt"
+        if not isinstance(turn, Mapping) or turn.get("from") != expected_role:
+            raise ValueError(f"conversations[{index}].from must be {expected_role!r}")
+        value = turn.get("value")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"conversations[{index}].value must be a nonempty string")
+    if require_answer and len(turns) != 2:
+        raise ValueError("Training conversations must contain a gpt answer after the human message")
+    question = turns[0]["value"]
+    if question.count("<image>") > 1:
+        raise ValueError("Single-image conversations may contain at most one <image> placeholder")
+    # build_prompt inserts the image placeholder; keep all surrounding context.
+    result["question"] = question.replace("<image>", "").strip()
+    if len(turns) == 2:
+        result.setdefault("answer", turns[1]["value"])
+    return result
+
+
 def normalize_record(record: Mapping[str, Any], *, require_answer: bool = True) -> Dict[str, Any]:
     """Validate QA semantics without opening files; return a normalized copy.
 
     Options may contain 2--8 entries, either a list or a contiguous A--H map.
     Text answers to MCQs must uniquely match an option; unsupported answers
     are rejected instead of being guessed or silently assigned to an option.
+    Also accepts a single LLaVA-style human/gpt conversation pair.
     """
     if not isinstance(record, Mapping):
         raise ValueError("Each QA record must be a JSON object")
-    result = dict(record)
-    result["question"] = _text(record.get("question"), "question")
-    options = record.get("options")
+    result = _adapt_conversations(record, require_answer=require_answer)
+    result["question"] = _text(result.get("question"), "question")
+    options = result.get("options")
     if options is not None:
         if isinstance(options, list):
             if not 2 <= len(options) <= 8:
@@ -67,8 +103,8 @@ def normalize_record(record: Mapping[str, Any], *, require_answer: bool = True) 
     else:
         result["options"] = None
 
-    if require_answer or record.get("answer") is not None:
-        answer = _text(record.get("answer"), "answer")
+    if require_answer or result.get("answer") is not None:
+        answer = _text(result.get("answer"), "answer")
         if result["options"] is not None:
             options = result["options"]
             by_letter = answer.upper() if len(answer) == 1 and answer.upper() in options else None
@@ -82,6 +118,11 @@ def normalize_record(record: Mapping[str, Any], *, require_answer: bool = True) 
             else:
                 raise ValueError("MCQ answer must be an existing option letter or the exact text of one option")
         result["answer"] = answer
+    if result.get("category") is None:
+        for key in ("class", "sub_dataset"):
+            if result.get(key) is not None:
+                result["category"] = result[key]
+                break
     if "category" in result and result["category"] is not None:
         result["category"] = _text(result["category"], "category")
     return result
