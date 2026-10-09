@@ -1,0 +1,9 @@
+# Install the appropriate PyTorch build FIRST (see README); do not mix CPU/CUDA wheels.
+torch>=2.1.2,<2.6
+transformers==4.46.1
+accelerate==0.34.0
+numpy==1.26.4
+pillow==10.4.0
+opencv-python==4.10.0.84
+safetensors>=0.4.3,<0.9
+# Optional for --attn-implementation flash_attention_2: a matching flash-attn build.
