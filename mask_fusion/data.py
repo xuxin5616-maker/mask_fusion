@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import string
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -75,11 +76,17 @@ def normalize_record(record: Mapping[str, Any], *, require_answer: bool = True) 
     Options may contain 2--8 entries, either a list or a contiguous A--H map.
     Text answers to MCQs must uniquely match an option; unsupported answers
     are rejected instead of being guessed or silently assigned to an option.
-    Also accepts a single LLaVA-style human/gpt conversation pair.
+    Also accepts a single LLaVA-style human/gpt conversation pair or legacy
+    Triad ``text``/``question_id`` fields. A legacy binary ``gt`` is metadata,
+    never a synthesized training answer.
     """
     if not isinstance(record, Mapping):
         raise ValueError("Each QA record must be a JSON object")
     result = _adapt_conversations(record, require_answer=require_answer)
+    if "question" not in result and "conversations" not in result and "text" in result:
+        result["question"] = result["text"]
+    if "id" not in result and "question_id" in result:
+        result["id"] = result["question_id"]
     result["question"] = _text(result.get("question"), "question")
     options = result.get("options")
     if options is not None:
@@ -232,13 +239,34 @@ def read_records(data_path: Any) -> List[Dict[str, Any]]:
     return records
 
 
+class MissingImageError(ValueError):
+    """The record has no usable image; it may be skipped before QA validation."""
+
+
+def resolve_image_path(record: Mapping[str, Any], data_root: Path) -> Path:
+    """Resolve a single image, separating missing images from unsupported types."""
+    value = record.get("image")
+    if value is None or (isinstance(value, str) and not value.strip()) or value == []:
+        raise MissingImageError("image field is missing or empty")
+    if not isinstance(value, str):
+        raise ValueError(f"image must be a single file path string, got {type(value).__name__}")
+    path = Path(value)
+    path = (path if path.is_absolute() else data_root / path).resolve()
+    if not path.is_file():
+        raise MissingImageError(f"image file does not exist: {path}")
+    return path
+
+
 class QADataset(Dataset):
     """Concatenate manifests in caller order, retaining per-record provenance.
 
     ``data_paths`` always contains resolved manifests. ``data_path`` retains its
     original single-Path API for one manifest and is a tuple for multiple files.
     ``sources`` parallels ``records`` with source_file/source_index (zero-based)
-    without inserting or overwriting fields in the user's records.
+    without inserting or overwriting fields in the user's records. Original IDs
+    may repeat; each source file and record index identifies a separate sample.
+    Records without images are skipped at construction, with their source
+    positions and reasons retained in ``skipped_records``.
     """
     def __init__(
         self, data_path: Any, tokenizer: Any, processor: Any, model_config: Any,
@@ -257,29 +285,44 @@ class QADataset(Dataset):
         self.epoch = 0
         self.records = []
         self.sources = []
+        self.skipped_records = []
         for source_path in self.data_paths:
             source_root = explicit_root if explicit_root is not None else source_path.parent
-            seen_ids = set()
+            source_skips = []
             for source_index, raw in enumerate(read_records(source_path)):
                 try:
+                    image_path = resolve_image_path(raw, source_root)
                     record = normalize_record(raw, require_answer=training)
                     record.setdefault("id", str(source_index))
-                    record_id = str(record["id"])
-                    if record_id in seen_ids:
-                        raise ValueError(f"duplicate record id {record_id!r}")
-                    seen_ids.add(record_id)
-                    for key in ("image", "mask"):
-                        value = raw.get(key)
-                        if not isinstance(value, str) or not value.strip():
-                            raise ValueError(f"{key} must be a nonempty file path")
-                        path = Path(value)
-                        record[key] = str((path if path.is_absolute() else source_root / path).resolve())
-                        if not Path(record[key]).is_file():
-                            raise FileNotFoundError(f"Missing {key}: {record[key]}")
+                    record["image"] = str(image_path)
+                    value = raw.get("mask")
+                    if not isinstance(value, str) or not value.strip():
+                        raise ValueError("mask must be a nonempty file path")
+                    path = Path(value)
+                    record["mask"] = str((path if path.is_absolute() else source_root / path).resolve())
+                    if not Path(record["mask"]).is_file():
+                        raise FileNotFoundError(f"Missing mask: {record['mask']}")
                     self.records.append(record)
                     self.sources.append({"source_file": str(source_path), "source_index": source_index})
+                except MissingImageError as error:
+                    source_skips.append({
+                        "source_file": str(source_path), "source_index": source_index,
+                        "id": raw.get("id", raw.get("question_id")), "reason": str(error),
+                    })
                 except (ValueError, OSError) as error:
                     raise ValueError(f"{source_path}: record {source_index}: {error}") from error
+            if source_skips:
+                self.skipped_records.extend(source_skips)
+                examples = "; ".join(f"record {item['source_index']}: {item['reason']}" for item in source_skips[:3])
+                warnings.warn(
+                    f"{source_path}: skipped {len(source_skips)} records with missing images. {examples}",
+                    UserWarning, stacklevel=2,
+                )
+        if not self.records:
+            raise ValueError(
+                "No usable samples remain after skipping records with missing images; "
+                "check --data-root and image paths."
+            )
 
     def __len__(self) -> int:
         return len(self.records)

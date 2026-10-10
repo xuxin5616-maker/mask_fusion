@@ -73,16 +73,19 @@ def validate_splits(
     visual example. Different splits must never share an image, including when
     ``allow_shared_categories`` is enabled. Each split accepts a single path or
     an ordered list of paths. Relative image/mask paths use the owning manifest's
-    directory unless data_root overrides all sources. IDs must be present and
-    unique within each source file; independently numbered sources may reuse
-    local IDs. A resolved manifest may occur only once across all splits.
+    directory unless data_root overrides all sources. IDs must be present but
+    may repeat: each manifest and record index identifies a separate sample.
+    A resolved manifest may occur only once across all splits.
+    Missing images are skipped before QA checks, matching QADataset; the
+    report lists skipped source positions and reasons. Each retained split
+    must still contain at least one usable sample.
 
     ``check_pixels=False`` checks manifests and file existence only. True also
     loads each unique mask once, verifies scalar finite nonnegative values via
     load_mask, and rejects scores above score_scale. No normal/abnormal labels
     are inferred from answer text, option letters, or file names.
     """
-    from .data import normalize_data_paths, normalize_record, read_records
+    from .data import MissingImageError, normalize_data_paths, normalize_record, read_records, resolve_image_path
 
     try:
         score_scale = float(score_scale)
@@ -122,6 +125,7 @@ def validate_splits(
     checked_masks = {}
     all_masks = set()
     total_qa = 0
+    skipped_records = []
 
     for split, manifests in split_manifests.items():
         counts = _new_counts()
@@ -134,19 +138,16 @@ def validate_splits(
                 records = read_records(manifest)
             except (OSError, ValueError) as error:
                 raise ValueError(f"{split} {manifest}: {error}") from error
-            ids = set()
             source_counts = _new_counts()
+            source_skips = []
             for index, raw in enumerate(records):
                 try:
+                    image = resolve_image_path(raw, source_root)
                     record = normalize_record(raw, require_answer=True)
-                    identifier = _identifier(record.get("id"))
-                    if identifier in ids:
-                        raise ValueError(f"Duplicate id {identifier!r} within source file")
-                    ids.add(identifier)
+                    _identifier(record.get("id"))
                     category = record.get("category")
                     if not isinstance(category, str) or not category:
                         raise ValueError("category is required to validate category-held-out evaluation")
-                    image = _file_path(record, "image", source_root)
                     mask = _file_path(record, "mask", source_root)
                     if image in image_categories and image_categories[image] != category:
                         raise ValueError(
@@ -184,17 +185,30 @@ def validate_splits(
                         checked_masks[mask] = {"min": minimum, "max": maximum}
                     _add_record(counts, image, mask, category, record)
                     _add_record(source_counts, image, mask, category, record)
+                except MissingImageError as error:
+                    source_skips.append({
+                        "split": split, "source_file": str(manifest), "source_index": index,
+                        "id": raw.get("id"), "reason": str(error),
+                    })
                 except (OSError, ValueError) as error:
                     raise ValueError(f"{split} {manifest}: record {index + 1}: {error}") from error
+            skipped_records.extend(source_skips)
             source_reports.append({
                 "manifest": str(manifest), "data_root": str(source_root), **_report_counts(source_counts),
+                "skipped_missing_images": len(source_skips),
             })
 
+        if counts["qa_count"] == 0:
+            raise ValueError(
+                f"{split}: No usable samples remain after skipping records with missing images; "
+                "check --data-root and image paths."
+            )
         split_reports[split] = {
             "manifest": str(manifests[0]) if len(manifests) == 1 else None,
             "manifests": [str(manifest) for manifest in manifests],
             "data_root": str(next(iter(source_roots))) if len(source_roots) == 1 else None,
             "sources": source_reports, **_report_counts(counts),
+            "skipped_missing_images": sum(source["skipped_missing_images"] for source in source_reports),
         }
         all_masks.update(counts["masks"])
         total_qa += counts["qa_count"]
@@ -204,6 +218,9 @@ def validate_splits(
     }
     return {
         "status": "ok",
+        "checks_scope": "retained samples after skipping records with missing images",
+        "skipped_missing_images": len(skipped_records),
+        "skipped_records": skipped_records,
         "protocol": "shared_categories_allowed" if allow_shared_categories else "category_held_out",
         "checks": {
             "qa_schema": "passed", "required_category_and_id": "passed",
@@ -221,7 +238,7 @@ def validate_splits(
         "total": {"qa_count": total_qa, "unique_images": len(image_owners), "unique_masks": len(all_masks),
                   "category_count": len(category_owners)},
         "normality_note": "Normal/abnormal counts are not inferred from answers, choices, or paths.",
-        "id_identity": "resolved_manifest_path + local_id; IDs are unique within each source file",
+        "id_identity": "resolved_manifest_path + zero_based_record_index; original IDs may repeat",
         "image_identity": "resolved_file_path; copied files with different paths are not content-deduplicated",
         "shared_categories": shared_categories,
         "splits": split_reports,

@@ -1,4 +1,4 @@
-"""Greedy single-image QA inference and optional MCQ accuracy reporting."""
+"""Greedy single-image inference with MCQ or explicit yes/no anomaly scoring."""
 
 import argparse
 from collections import defaultdict
@@ -9,6 +9,9 @@ import re
 import torch
 
 from .data import QADataset, collate_samples
+from .anomaly_metrics import (
+    extract_anomaly_prediction, summarize_anomaly_predictions, validate_anomaly_target,
+)
 from .model import load_model, read_adapter_config
 from .train import _move, _resolve_dtype, _autocast
 
@@ -54,6 +57,10 @@ def main(argv=None):
     parser.add_argument("--vision-tower", help="Override an unavailable SigLIP path in the base config")
     parser.add_argument("--data", required=True, help="JSONL/JSON QA records; answer is optional")
     parser.add_argument("--data-root")
+    parser.add_argument(
+        "--eval-task", choices=("qa", "anomaly"), default="qa",
+        help="qa: score labeled MCQs; anomaly: score leading yes/no against gt=1/0 without changing the prompt",
+    )
     parser.add_argument("--output", required=True, help="Predictions JSONL")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--device", default="cuda")
@@ -87,6 +94,17 @@ def main(argv=None):
         mode=metadata["image_mode"], seed=args.seed, training=False,
         max_text_length=args.max_text_length,
     )
+    if args.eval_task == "anomaly":
+        # Validate the complete retained set before writing partial predictions.
+        # gt is only an evaluation target: it is never converted into a prompt.
+        for index, record in enumerate(dataset.records):
+            try:
+                validate_anomaly_target(record)
+                if record["options"] is not None:
+                    raise ValueError("anomaly scoring requires yes/no prompts without options; use --eval-task qa for MCQs")
+            except ValueError as error:
+                source = dataset.sources[index]
+                raise ValueError(f"{source['source_file']}: record {source['source_index']}: {error}") from error
     output.parent.mkdir(parents=True, exist_ok=True)
     predictions = []
     with output.open("w", encoding="utf-8") as handle, torch.inference_mode():
@@ -107,18 +125,30 @@ def main(argv=None):
             expected = record.get("answer")
             result = {
                 "id": record["id"], "image": record["image"], "category": record.get("category"),
+                "mask": record["mask"], **dataset.sources[index],
                 "question": record["question"], "options": record["options"],
                 "prediction": answer, "choice": choice, "answer": expected,
                 "correct": ((choice == expected) if expected is not None and record["options"] else None),
             }
+            if args.eval_task == "anomaly":
+                predicted_label = extract_anomaly_prediction(answer)
+                result.update({
+                    "gt": record["gt"], "anomaly_prediction": predicted_label,
+                    "correct": predicted_label == record["gt"],
+                })
             predictions.append(result)
             handle.write(json.dumps(result, ensure_ascii=False) + "\n")
             handle.flush()
             print(f"[{index + 1}/{len(dataset)}] {record['id']}: {answer}", flush=True)
-    metrics = summarize_predictions(predictions)
+    metrics = (summarize_anomaly_predictions(predictions) if args.eval_task == "anomaly"
+               else summarize_predictions(predictions))
     metrics.update({"adapter": str(Path(args.adapter).resolve()), "base_model": str(base),
                     "image_mode": metadata["image_mode"], "dtype": dtype_name,
-                    "attention": args.attn_implementation, "seed": args.seed})
+                    "attention": args.attn_implementation, "seed": args.seed,
+                    "eval_task": args.eval_task,
+                    "input_records": len(dataset) + len(dataset.skipped_records),
+                    "skipped_missing_images": len(dataset.skipped_records),
+                    "skipped_records": dataset.skipped_records})
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 

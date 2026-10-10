@@ -96,6 +96,8 @@ python -m pip install -r requirements.txt
 - 默认原值范围 0–255，融合模块统一除以 255；若源文件已经统一缩放到 0–1，请将 `score_scale` 显式设为 1，不能再除一次 255。
 - `examples/train.jsonl` 仅说明格式，其图像和 mask 路径是待替换的示例，不是可直接训练的数据。
 
+缺少 `image`、值为 `null`/空字符串/空列表，或图片文件不存在时，训练、推理和预检会跳过该条记录。训练加载器按文件报告跳过数量及最多三个原因示例，完整来源与原因保存在 `dataset.skipped_records`；预检 JSON 报告提供 `skipped_missing_images` 和 `skipped_records`。记录序号保留为原文件中的位置。图片路径必须是单个字符串，非空列表等未支持的格式仍报错；有图片但缺少 mask、问答无效等错误也仍报错。若整个数据集（预检时的任一指定划分）过滤后为空，会停止并提示检查根目录和图片路径。
+
 选择题 prompt 明确要求只回答选项字母。SFT 仅监督 assistant 答案和 ChatML 结束 token；system/user、图像和 padding 的标签均为 `-100`。超长文本或图像展开后超出上下文时直接报错，不静默截掉答案。
 
 ### 原 LLaVA / Triad 对话格式
@@ -132,7 +134,7 @@ python -m mask_fusion.train \
   --output outputs/multi_file
 ```
 
-每个文件里的相对 `image`、`mask` 路径默认从该文件所在目录解析。例如 `/data/product_a/train.jsonl` 里的 `images/001.png` 对应 `/data/product_a/images/001.png`。需要统一数据根目录时再显式传 `--data-root`；验证集可使用 `--val-data-root`。同一文件内的 ID 必须唯一，不同文件可以有相同本地 ID；重复传入同一个文件会报错。
+每个文件里的相对 `image`、`mask` 路径默认从该文件所在目录解析。例如 `/data/product_a/train.jsonl` 里的 `images/001.png` 对应 `/data/product_a/images/001.png`。需要统一数据根目录时再显式传 `--data-root`；验证集可使用 `--val-data-root`。同一文件内和不同文件间的 ID 均可重复，原始 ID 保留，训练与预检均按每条记录计数，不按 ID 合并或去重。样本通过源文件路径和记录序号区分；重复传入同一个文件仍会报错。
 
 ### 空间对应
 
@@ -286,6 +288,36 @@ python -m mask_fusion.infer --adapter /path/runs/mask_fusion_both/best --base-mo
 
 选择题解析器接受独立选项字母或精确的选项文本，不从任意长句中猜一个字母。无法解析的有标注选择题计为错误并单独报告。
 
+### Triad 原始 JSONL：yes/no 异常判断
+
+旧测试格式中的 `text` 会在没有 `question` 和 `conversations` 时作为问题，`question_id` 在没有 `id` 时作为编号。保留原始问题和 `mask` 字段，不自动改用 `musc_mask` 或 `muscv2_mask`，也不根据 `gt` 合成训练答案。例如：
+
+```json
+{"question_id":"000000000","image":"Traid_eval_data/mvtec/imgs/000000000.png","text":"Is there any defect in this image? If yes, say 'yes', otherwise say 'no'. Then describe it.","gt":1,"class":"toothbrush","mask":"Traid_eval_data/mvtec/masks_muscv2_classnorm_group_score/000000000.png"}
+```
+
+这种任务通过显式参数 `--eval-task anomaly` 评分：`gt` 必须为整数 0（正常）或 1（异常），且问题应要求回答是否存在缺陷。程序保留问题原文，只解析回答开头独立的 Yes/No，后面可以接标点、换行和说明文字；不会从描述中搜索 yes/no，也不会猜测 A/B 与正常/异常的对应关系。带结构化 `options` 的选择题继续使用默认 `--eval-task qa`。
+
+对应上述记录，根目录应为 `/home/yz/xxy/data/datasets`，因为记录本身已经包含 `Traid_eval_data/...`：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mask_fusion.infer \
+  --adapter outputs/fsdp_2gpu \
+  --base-model /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov \
+  --data /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc_muscv2_classnorm_group_score.jsonl \
+  --data-root /home/yz/xxy/data/datasets \
+  --eval-task anomaly \
+  --output results/mvtec_final.jsonl \
+  --device cuda:0 --dtype bfloat16 --attn-implementation sdpa \
+  --max-new-tokens 64
+```
+
+`--adapter` 指向实际训练输出目录。未配置验证集时使用输出根目录的最终权重；已配置验证集时可选择验证损失最低的 `best/`。
+
+预测文件保存完整描述、`gt`、`anomaly_prediction`（1/0/null）和 `correct`。指标文件报告 `accuracy`、产品类别宏平均 `macro_category_accuracy`、各类别统计、正常/异常召回率、`balanced_accuracy` 和无法解析数量 `unparseable_anomaly`。无法解析的回答计为错误，仍保留在准确率和对应类别召回率的分母中；测试集只含正常或只含异常时，缺失类召回率及 balanced accuracy 为 null。混淆统计另外列出未解析的正常/异常数量，不能只用 TP/TN/FP/FN 之和当作总样本数。
+
+这套指标只评估 yes/no 异常判断，不自动评价后续描述，也不计算缺少连续模型分数的 AUROC。所有推理模式均在指标文件中记录 `input_records`、`skipped_missing_images` 和跳过记录明细，检查结果时需核对实际保留的测试样本数量。图像与类别必须按预定测试划分独立于训练集。
+
 ## 验证与当前边界
 
 ```bash
@@ -301,6 +333,8 @@ python -m unittest discover -s tests -v
 同日，加入多文件与启动脚本后，全部 107 项测试通过。新增覆盖多源相对路径、JSON/JSONL 混用、文件内 ID 去重、跨文件划分检查、多文件训练的中途断点恢复，以及第二个文件内容变化后的恢复拒绝。启动脚本通过真实 Git Bash 的语法和 dry-run 参数测试，覆盖带空格路径、数组与命令行覆盖、环境变量和必填数据检查；这不等同于在 GPU 上执行训练。
 
 同日，真实两个 CPU/Gloo 进程的 FSDP `FULL_SHARD` 小模型检查通过：同步梯度累积、末尾不足一个累积组、冻结参数不变、CNN/Q/alpha/projector 梯度、adapter 单设备重载以及优化器/调度器恢复后的下一步一致。CPU 路径需要关闭冗余的 state-dict CPU offload，避免本地 PyTorch 2.5.1 在原地 CPU 转换时复用存储；生产 CUDA 路径仍将完整 checkpoint 状态卸载到 CPU。这些 CPU 检查不等同于实际 CUDA/NCCL 双卡测试；后者使用上面的 `tests/fsdp_smoke.py`。
+
+2026-10-10：Triad 测试 JSONL 字段兼容与 yes/no 异常计分接入后，144 项测试通过，推理 CLI `--help` 通过。新增用用户提供的记录结构验证真实图像/mask 路径、保留原始问题、标签不进入模型输入、未解析回答计错，以及正常/异常分母和缺图报告。生成模型在该集成测试中使用替身，未据此报告用户训练权重的实际准确率。
 
 尚未用真实 7B checkpoint、GPU 和用户数据完成训练或评估。没有报告模型收益或显存/速度结论。当前 CLI 包含单 GPU 和可选 FSDP 分片训练入口，双 GPU 路径仍需在 Linux/NCCL/CUDA 服务器实际验证。支持单图 QA（含该图多个 crop），不包含普通 DDP、量化、视频或多张独立图像对话。
 

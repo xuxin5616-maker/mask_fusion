@@ -133,13 +133,16 @@ class DatasetTests(unittest.TestCase):
         self.data.write_text(json.dumps(self.record), encoding="utf-8")
         self.assertEqual(self.dataset(data_root=self.root).records[0]["mask"], str((self.root / "mask.npy").resolve()))
 
-    def test_missing_mask_and_duplicate_record_id_fail_early(self):
+    def test_missing_mask_fails_but_duplicate_record_ids_keep_all_samples(self):
         self.data.write_text(json.dumps({**self.record, "mask": "missing.npy"}), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "Missing mask"):
             self.dataset()
         self.data.write_text("\n".join([json.dumps(self.record)] * 2), encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, "duplicate record id"):
-            self.dataset()
+        dataset = self.dataset()
+        self.assertEqual(len(dataset), 2)
+        self.assertEqual([record["id"] for record in dataset.records], [self.record["id"]] * 2)
+        self.assertEqual(dataset.records[0], dataset.records[1])
+        self.assertEqual([source["source_index"] for source in dataset.sources], [0, 1])
 
     @patch("mask_fusion.data._image_tokenize", side_effect=fake_image_tokenize)
     def test_text_is_not_silently_truncated(self, _):
@@ -214,13 +217,19 @@ class MultiManifestTests(unittest.TestCase):
         self.assertEqual({record["image"] for record in overridden.records}, {str((self.first.parent / "image.png").resolve())})
         self.assertEqual({record["mask"] for record in overridden.records}, {str((self.first.parent / "mask.npy").resolve())})
 
-    def test_duplicate_ids_within_one_file_still_include_source_and_position(self):
-        self.second.write_text(json.dumps([self.second_record, self.second_record]), encoding="utf-8")
-        with self.assertRaises(ValueError) as error:
-            self.dataset()
-        self.assertIn(str(self.second.resolve()), str(error.exception))
-        self.assertIn("record 1", str(error.exception))
-        self.assertIn("duplicate record id", str(error.exception))
+    def test_duplicate_ids_within_one_file_preserve_questions_and_distinct_positions(self):
+        later = {**self.second_record, "question": "Another question for the same image?", "answer": "A"}
+        self.second.write_text(json.dumps([self.second_record, later]), encoding="utf-8")
+        dataset = self.dataset()
+        self.assertEqual(len(dataset), 4)
+        self.assertEqual([record["id"] for record in dataset.records[2:]], ["shared", "shared"])
+        self.assertEqual([record["question"] for record in dataset.records[2:]],
+                         [self.second_record["question"], later["question"]])
+        self.assertEqual([record["answer"] for record in dataset.records[2:]], ["B", "A"])
+        self.assertEqual(dataset.sources[2:], [
+            {"source_file": str(self.second.resolve()), "source_index": 0},
+            {"source_file": str(self.second.resolve()), "source_index": 1},
+        ])
 
     def test_manifest_helper_accepts_singletons_and_rejects_empty_or_duplicate_inputs(self):
         self.assertEqual(normalize_data_paths(str(self.first)), [self.first.resolve()])

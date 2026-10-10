@@ -140,8 +140,11 @@ class ConversationManifestTests(unittest.TestCase):
             scores = np.arange(24, dtype=np.float32).reshape(4, 6)
             np.save(root / "mask.npy", scores)
             raw = conversation_record()
+            repeated_id = copy.deepcopy(raw)
+            repeated_id["conversations"][0]["value"] = "<image>\nAre the labels aligned?"
+            repeated_id["conversations"][1]["value"] = "The labels are aligned."
             first = root / "conversation.json"
-            first.write_text(json.dumps([raw]), encoding="utf-8")
+            first.write_text(json.dumps([raw, repeated_id]), encoding="utf-8")
             second = root / "flat.jsonl"
             second.write_text(json.dumps({
                 "id": "flat_q", "image": "image.png", "mask": "mask.npy",
@@ -149,19 +152,25 @@ class ConversationManifestTests(unittest.TestCase):
             }) + "\n", encoding="utf-8")
             # Alternative expert paths do not exist: only the selected mask is used.
             dataset = QADataset([first, second], FakeTokenizer(), object(), SimpleNamespace())
+            self.assertEqual(len(dataset), 3)
+            self.assertEqual([record["id"] for record in dataset.records[:2]], [raw["id"]] * 2)
+            self.assertEqual(dataset.records[1]["answer"], "The labels are aligned.")
             prepared = {
                 "images": torch.zeros(1, 3, 8, 8), "masks": torch.ones(1, 1, 8, 8),
                 "mask_valid": torch.ones(1, 1, 8, 8, dtype=torch.bool), "image_size": (6, 4),
             }
             with patch("mask_fusion.preprocessing.prepare_image_mask", return_value=prepared) as prepare:
                 sample = dataset[0]
+                repeated_sample = dataset[1]
             np.testing.assert_array_equal(prepare.call_args.args[1], scores)
             self.assertEqual(dataset.records[0]["mask"], str((root / "mask.npy").resolve()))
             self.assertIn("labels", sample)
+            self.assertEqual(repeated_sample["labels"][repeated_sample["labels"] != IGNORE_INDEX].tolist(),
+                             FakeTokenizer()("The labels are aligned.<|im_end|>").input_ids)
             report = validate_splits([first, second], check_pixels=True)
-            self.assertEqual(report["total"]["qa_count"], 2)
+            self.assertEqual(report["total"]["qa_count"], 3)
             self.assertEqual(report["splits"]["train"]["categories"], ["banana_juice"])
-            self.assertEqual(report["splits"]["train"]["free_text_count"], 2)
+            self.assertEqual(report["splits"]["train"]["free_text_count"], 3)
 
     def test_conversation_class_still_detects_cross_split_category_leakage(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -181,6 +190,7 @@ class ConversationManifestTests(unittest.TestCase):
     def test_invalid_conversation_error_identifies_source_record(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "invalid_conversation.json"
+            Image.new("RGB", (4, 4)).save(path.parent / "image.png")
             raw = conversation_record()
             raw["conversations"] += raw["conversations"]
             path.write_text(json.dumps([raw]), encoding="utf-8")

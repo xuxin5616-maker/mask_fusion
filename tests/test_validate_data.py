@@ -93,7 +93,7 @@ class ValidateDataTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "conflicting category"):
             validate_splits(train, val)
 
-    def test_requires_category_and_id_and_unique_ids(self):
+    def test_requires_category_and_valid_id_but_accepts_repeated_ids(self):
         for key in ("id", "category"):
             record = self.record()
             del record[key]
@@ -107,14 +107,15 @@ class ValidateDataTests(unittest.TestCase):
         path = self.write("train.jsonl", [self.record(identifier=0)])
         self.assertEqual(validate_splits(path)["total"]["qa_count"], 1)
         path = self.write("train.jsonl", [self.record(identifier=1), self.record(2, identifier="1")])
-        with self.assertRaisesRegex(ValueError, "Duplicate id"):
-            validate_splits(path)
+        self.assertEqual(validate_splits(path)["total"]["qa_count"], 2)
 
     def test_missing_files_invalid_qa_and_empty_manifest_are_rejected(self):
-        for key in ("image", "mask"):
-            path = self.write("train.jsonl", [self.record(**{key: "missing.file"})])
-            with self.subTest(key=key), self.assertRaisesRegex(ValueError, f"Missing {key}"):
-                validate_splits(path)
+        path = self.write("train.jsonl", [self.record(mask="missing.file")])
+        with self.assertRaisesRegex(ValueError, "Missing mask"):
+            validate_splits(path)
+        path = self.write("train.jsonl", [self.record(image="missing.file")])
+        with self.assertRaisesRegex(ValueError, "No usable samples"):
+            validate_splits(path)
         path = self.write("train.jsonl", [self.record(answer="C")])
         with self.assertRaisesRegex(ValueError, "MCQ answer"):
             validate_splits(path)
@@ -124,7 +125,7 @@ class ValidateDataTests(unittest.TestCase):
 
     def test_data_root_matches_dataset_path_resolution(self):
         path = self.write("manifests/train.jsonl", [self.record()])
-        with self.assertRaisesRegex(ValueError, "Missing image"):
+        with self.assertRaisesRegex(ValueError, "No usable samples"):
             validate_splits(path)
         report = validate_splits(path, data_root=self.root)
         self.assertEqual(report["splits"]["train"]["data_root"], str(self.root.resolve()))
@@ -199,11 +200,18 @@ class ValidateDataTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "second.jsonl.*conflicting category"):
             validate_splits([first, second], allow_shared_categories=True)
 
-    def test_duplicate_ids_within_later_source_are_still_rejected(self):
+    def test_duplicate_ids_within_later_source_count_as_separate_samples(self):
         first = self.write("first.jsonl", [self.record(identifier="q1")])
-        second = self.write("second.jsonl", [self.record(2, identifier="q1"), self.record(3, identifier="q1")])
-        with self.assertRaisesRegex(ValueError, "second.jsonl: record 2: Duplicate id"):
-            validate_splits([first, second])
+        second = self.write("second.jsonl", [
+            self.record(2, identifier="q1"), self.record(2, identifier="q1"),
+            self.record(3, identifier="q1"),
+        ])
+        report = validate_splits([first, second], check_pixels=True)
+        self.assertEqual(report["total"]["qa_count"], 4)
+        self.assertEqual(report["total"]["unique_images"], 3)
+        self.assertEqual(report["checked_mask_count"], 3)
+        self.assertEqual([source["qa_count"] for source in report["splits"]["train"]["sources"]], [1, 3])
+        self.assertIn("record_index", report["id_identity"])
 
     def test_duplicate_resolved_manifests_are_rejected_within_and_across_splits(self):
         path = self.write("train.jsonl", [self.record()])
