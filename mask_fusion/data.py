@@ -107,6 +107,8 @@ def normalize_record(record: Mapping[str, Any], *, require_answer: bool = True) 
         if len(set(values)) != len(values):
             raise ValueError("Option texts must be distinct")
         result["options"] = normalized
+        if "mcq_instruction" in result:
+            result["mcq_instruction"] = _text(result["mcq_instruction"], "mcq_instruction")
     else:
         result["options"] = None
 
@@ -150,7 +152,7 @@ def build_prompt(record: Mapping[str, Any], model_config: Any = None) -> str:
     question = image_token + "\n" + record["question"]
     if record["options"] is not None:
         question += "\n" + "\n".join(f"{key}. {value}" for key, value in record["options"].items())
-        question += "\nAnswer with the option letter only."
+        question += "\n" + record.get("mcq_instruction", "Answer with the option letter only.")
     return (
         f"<|im_start|>system\n{SYSTEM_MESSAGE}<|im_end|>\n"
         f"<|im_start|>user\n{question}<|im_end|>\n"

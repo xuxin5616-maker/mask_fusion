@@ -1,4 +1,4 @@
-"""Greedy single-image inference with MCQ or explicit yes/no anomaly scoring."""
+"""Greedy single-image inference with MCQ and binary anomaly scoring."""
 
 import argparse
 from collections import defaultdict
@@ -14,6 +14,29 @@ from .anomaly_metrics import (
 )
 from .model import load_model, read_adapter_config
 from .train import _move, _resolve_dtype, _autocast
+
+
+CATEGORY_MCQ_INSTRUCTION = "Answer with the option's letter from the given choices directly."
+
+
+def category_anomaly_record(record):
+    """Build the requested test-only prompt without using any target label."""
+    category = record.get("category")
+    if not isinstance(category, str) or not category.strip():
+        raise ValueError("category-mcq requires category (or class/sub_dataset in the source record)")
+    readable_category = " ".join(category.replace("_", " ").split())
+    if not readable_category:
+        raise ValueError("category-mcq requires a nonempty readable category")
+    return {
+        **record,
+        "original_question": record["question"],
+        "question": f"Are there any defects on the {readable_category} in this image?",
+        "options": {"A": "Yes", "B": "No"},
+        "mcq_instruction": CATEGORY_MCQ_INSTRUCTION,
+        # Keep reference answers out of the runtime prompt record. gt is read
+        # separately for scoring after generation, never by this helper.
+        "answer": None,
+    }
 
 
 def extract_choice(text, options):
@@ -59,7 +82,11 @@ def main(argv=None):
     parser.add_argument("--data-root")
     parser.add_argument(
         "--eval-task", choices=("qa", "anomaly"), default="qa",
-        help="qa: score labeled MCQs; anomaly: score leading yes/no against gt=1/0 without changing the prompt",
+        help="qa: score labeled MCQs; anomaly: score defect judgments against gt=1/0",
+    )
+    parser.add_argument(
+        "--anomaly-prompt", choices=("original", "category-mcq"), default="original",
+        help="With --eval-task anomaly: keep the original yes/no prompt, or ask the category-specific A=Yes/B=No question",
     )
     parser.add_argument("--output", required=True, help="Predictions JSONL")
     parser.add_argument("--overwrite", action="store_true")
@@ -72,6 +99,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.max_new_tokens < 1:
         parser.error("max-new-tokens must be positive")
+    if args.anomaly_prompt != "original" and args.eval_task != "anomaly":
+        parser.error("--anomaly-prompt category-mcq requires --eval-task anomaly")
     output = Path(args.output)
     metrics_path = output.with_suffix(".metrics.json")
     if not args.overwrite and (output.exists() or metrics_path.exists()):
@@ -100,7 +129,9 @@ def main(argv=None):
         for index, record in enumerate(dataset.records):
             try:
                 validate_anomaly_target(record)
-                if record["options"] is not None:
+                if args.anomaly_prompt == "category-mcq":
+                    dataset.records[index] = category_anomaly_record(record)
+                elif record["options"] is not None:
                     raise ValueError("anomaly scoring requires yes/no prompts without options; use --eval-task qa for MCQs")
             except ValueError as error:
                 source = dataset.sources[index]
@@ -131,7 +162,15 @@ def main(argv=None):
                 "correct": ((choice == expected) if expected is not None and record["options"] else None),
             }
             if args.eval_task == "anomaly":
-                predicted_label = extract_anomaly_prediction(answer)
+                if args.anomaly_prompt == "category-mcq":
+                    predicted_label = {"A": 1, "B": 0}.get(choice)
+                    result.update({
+                        "original_question": record["original_question"],
+                        "mcq_instruction": record["mcq_instruction"],
+                        "answer": "A" if record["gt"] == 1 else "B",
+                    })
+                else:
+                    predicted_label = extract_anomaly_prediction(answer)
                 result.update({
                     "gt": record["gt"], "anomaly_prediction": predicted_label,
                     "correct": predicted_label == record["gt"],
@@ -146,6 +185,7 @@ def main(argv=None):
                     "image_mode": metadata["image_mode"], "dtype": dtype_name,
                     "attention": args.attn_implementation, "seed": args.seed,
                     "eval_task": args.eval_task,
+                    "anomaly_prompt": args.anomaly_prompt,
                     "input_records": len(dataset) + len(dataset.skipped_records),
                     "skipped_missing_images": len(dataset.skipped_records),
                     "skipped_records": dataset.skipped_records})

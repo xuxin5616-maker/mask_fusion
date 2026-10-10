@@ -318,6 +318,35 @@ CUDA_VISIBLE_DEVICES=0 python -m mask_fusion.infer \
 
 这套指标只评估 yes/no 异常判断，不自动评价后续描述，也不计算缺少连续模型分数的 AUROC。所有推理模式均在指标文件中记录 `input_records`、`skipped_missing_images` 和跳过记录明细，检查结果时需核对实际保留的测试样本数量。图像与类别必须按预定测试划分独立于训练集。
 
+### 测试时按产品类别替换为 A/B 提示词
+
+在上述异常测试命令中增加 `--anomaly-prompt category-mcq`，即可在内存中替换本次测试的问题。物体类别来自规范化后的 `category`（原始数据兼容 `class`、`sub_dataset`），缺失时明确报错。以 `toothbrush` 为例，模型收到的问题内容为：
+
+```text
+Are there any defects on the toothbrush in this image?
+A. Yes
+B. No
+Answer with the option's letter from the given choices directly.
+```
+
+类别名中的下划线在提示词中转换为空格，例如 `metal_nut` 显示为 `metal nut`；统计里的类别名保持原值。选项和作答指令各出现一次，不再额外追加默认的选项字母指令。设置了结构化 `options` 的记录可通过 `mcq_instruction` 提供该结尾指令；未设置时沿用原来的默认指令。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m mask_fusion.infer \
+  --adapter outputs/fsdp_2gpu \
+  --base-model /home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov \
+  --data /home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc_muscv2_classnorm_group_score.jsonl \
+  --data-root /home/yz/xxy/data/datasets \
+  --eval-task anomaly --anomaly-prompt category-mcq \
+  --output results/mvtec_category_mcq.jsonl \
+  --device cuda:0 --dtype bfloat16 --attn-implementation sdpa \
+  --max-new-tokens 64
+```
+
+生成后按 A→1（异常）、B→0（正常）与 `gt` 比较，继续输出异常判断的准确率、类别统计和未解析数量。选项解析沿用 MCQ 规则，接受独立字母及精确选项文本，不从长解释里猜选项。`gt` 和正确答案不用于构造提示词，参考 `answer` 只在写出评分结果时生成。
+
+输出的 `question` 保存新题干，`options` 保存 A/B 选项，`mcq_instruction` 保存指定指令；`original_question` 保留输入的原始题目，`choice` 保存解析后的字母。指标文件的 `anomaly_prompt` 记录本次模板。原始 JSON 不会被写回，现有训练权重可直接用于这一测试。默认 `--anomaly-prompt original` 仍使用原来的 yes/no 问题；比较不同模型时应采用相同的提示词模板。
+
 ## 验证与当前边界
 
 ```bash
@@ -335,6 +364,8 @@ python -m unittest discover -s tests -v
 同日，真实两个 CPU/Gloo 进程的 FSDP `FULL_SHARD` 小模型检查通过：同步梯度累积、末尾不足一个累积组、冻结参数不变、CNN/Q/alpha/projector 梯度、adapter 单设备重载以及优化器/调度器恢复后的下一步一致。CPU 路径需要关闭冗余的 state-dict CPU offload，避免本地 PyTorch 2.5.1 在原地 CPU 转换时复用存储；生产 CUDA 路径仍将完整 checkpoint 状态卸载到 CPU。这些 CPU 检查不等同于实际 CUDA/NCCL 双卡测试；后者使用上面的 `tests/fsdp_smoke.py`。
 
 2026-10-10：Triad 测试 JSONL 字段兼容与 yes/no 异常计分接入后，144 项测试通过，推理 CLI `--help` 通过。新增用用户提供的记录结构验证真实图像/mask 路径、保留原始问题、标签不进入模型输入、未解析回答计错，以及正常/异常分母和缺图报告。生成模型在该集成测试中使用替身，未据此报告用户训练权重的实际准确率。
+
+同日，加入类别 A/B 测试提示词后，154 项测试通过。新增检查在模型输入边界逐字核对四行模板，确认选项和指令只出现一次、`gt` 变化不改变输入 token、A/B 计分正确，以及原来的默认 QA 和 yes/no 模式保持兼容。
 
 尚未用真实 7B checkpoint、GPU 和用户数据完成训练或评估。没有报告模型收益或显存/速度结论。当前 CLI 包含单 GPU 和可选 FSDP 分片训练入口，双 GPU 路径仍需在 Linux/NCCL/CUDA 服务器实际验证。支持单图 QA（含该图多个 crop），不包含普通 DDP、量化、视频或多张独立图像对话。
 
