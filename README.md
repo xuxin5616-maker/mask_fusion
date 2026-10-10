@@ -347,6 +347,47 @@ CUDA_VISIBLE_DEVICES=0 python -m mask_fusion.infer \
 
 输出的 `question` 保存新题干，`options` 保存 A/B 选项，`mcq_instruction` 保存指定指令；`original_question` 保留输入的原始题目，`choice` 保存解析后的字母。指标文件的 `anomaly_prompt` 记录本次模板。原始 JSON 不会被写回，现有训练权重可直接用于这一测试。默认 `--anomaly-prompt original` 仍使用原来的 yes/no 问题；比较不同模型时应采用相同的提示词模板。
 
+### MVTec 测试：在 A/B 问题前加入类别知识
+
+`--anomaly-prompt category-knowledge-mcq` 使用随项目分发的
+`mask_fusion/prompts/mvtec_category_knowledge.json`，覆盖原版 MVTec AD 的 15 个类别、73 种缺陷。
+程序按 `category`（兼容原始 `class`、`sub_dataset`）取出正常要求、正常外观变化与该类别全部可能缺陷的简短解释，
+然后询问是否异常。图像占位符、A. Yes / B. No 和作答指令仍由原有流程各添加一次。
+正常和异常样本使用同一份类别知识，`gt`、参考答案及 `origin_path` 不参与知识选择。
+不支持的类别会在生成和写出结果前报错；其他产品可继续使用 `category-mcq`。
+
+沿用已配置的 Linux 路径直接测试：
+
+```bash
+bash scripts/test_mvtec.sh
+```
+
+脚本默认使用 `outputs/fsdp_2gpu` 的 adapter、`llava-onevision-qwen2-7b-ov` 底座、
+`/home/yz/xxy/data/datasets/Traid_eval_data/mvtec/question_musc_muscv2_classnorm_group_score.jsonl` 测试集、
+GPU 0 和 bfloat16。图像模式从 adapter 配置读取；若保存的是 `randomroi`，本次仍使用 `randomroi`。
+结果保存在：
+
+- `results/mvtec_category_knowledge_mcq.jsonl`：每条预测及实际使用的知识题干。
+- `results/mvtec_category_knowledge_mcq.metrics.json`：原有准确率、混淆统计、各类别指标，另记录知识文件版本和 SHA-256。
+
+仅预览命令、切换权重或与原 A/B 提示对照：
+
+```bash
+DRY_RUN=1 bash scripts/test_mvtec.sh
+ADAPTER=outputs/fsdp_2gpu/best OUTPUT_FILE=results/mvtec_best_knowledge.jsonl bash scripts/test_mvtec.sh
+ANOMALY_PROMPT=category-mcq bash scripts/test_mvtec.sh
+```
+
+`DATA_ROOT`、`TEST_DATA`、`BASE_MODEL`、`CUDA_VISIBLE_DEVICES` 等也可通过环境变量设置；
+额外 CLI 参数可直接追加。选择对照模式建议使用 `ANOMALY_PROMPT` 环境变量，使默认输出名跟随模式改变。
+已有结果不会默认覆盖，重新运行需指定新的 `OUTPUT_FILE` 或明确追加 `--overwrite`。
+若继续使用之前的 `python -m mask_fusion.infer ...` 命令，只需将
+`--anomaly-prompt category-mcq` 改成 `--anomaly-prompt category-knowledge-mcq`，并改用新的 `--output`。
+
+这些描述是待验证的类别检测规则，不能替代正常视觉参考。例如 metal_nut/flip 说明了翻面属于异常，
+但没有编造正确朝向面的具体凹槽特征；cable_swap、pill_type 和 misplaced 也依赖预期产品结构或摆放标准。
+比较提示词时使用同一 checkpoint、相同数据顺序、seed、mask 和图像模式，同时检查异常召回及正常误报。
+
 ## 验证与当前边界
 
 ```bash

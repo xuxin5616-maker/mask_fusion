@@ -1,6 +1,7 @@
 """Verify category MCQ prompts at the inference/model boundary, without downloads."""
 
 import contextlib
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -12,7 +13,7 @@ import torch
 from PIL import Image
 
 from mask_fusion.data import IMAGE_TOKEN_INDEX
-from mask_fusion.infer import main
+from mask_fusion.infer import CATEGORY_KNOWLEDGE_PATH, main
 from test_data import fake_image_tokenize
 from test_infer_anomaly import DecodeTokenizer, RecordingModel
 
@@ -40,7 +41,7 @@ class CategoryPromptInferenceTests(unittest.TestCase):
             "--device", "cpu", "--dtype", "float32",
         ]
 
-    def run_infer(self, records, replies):
+    def run_infer(self, records, replies, *, prompt_mode="category-mcq"):
         self.manifest.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
         self.model = RecordingModel(replies, self.tokenizer)
         prepared = {
@@ -57,7 +58,7 @@ class CategoryPromptInferenceTests(unittest.TestCase):
             stack.enter_context(patch("mask_fusion.data._image_tokenize", side_effect=fake_image_tokenize))
             stack.enter_context(patch("mask_fusion.preprocessing.prepare_image_mask", return_value=prepared))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-            main(self.arguments() + ["--eval-task", "anomaly", "--anomaly-prompt", "category-mcq"])
+            main(self.arguments() + ["--eval-task", "anomaly", "--anomaly-prompt", prompt_mode])
         predictions = [json.loads(line) for line in self.output.read_text(encoding="utf-8").splitlines()]
         metrics = json.loads(self.output.with_suffix(".metrics.json").read_text(encoding="utf-8"))
         return predictions, metrics
@@ -169,6 +170,81 @@ class CategoryPromptInferenceTests(unittest.TestCase):
         read_config.assert_not_called()
         load_model.assert_not_called()
         self.assertFalse(self.output.exists())
+
+    def test_knowledge_reaches_model_without_labels_and_preserves_ab_scoring(self):
+        records = [
+            {**self.record, "origin_path": "metal_nut/test/flip/010.png"},
+            {**self.record, "question_id": "normal", "gt": 0,
+             "origin_path": "metal_nut/test/good/001.png"},
+            {**self.record, "question_id": "unparsed", "gt": 1},
+        ]
+        predictions, metrics = self.run_infer(
+            records, ["A", "B", "I cannot decide."], prompt_mode="category-knowledge-mcq",
+        )
+        for index, row in enumerate(predictions):
+            actual = self.actual_prompt(index)
+            self.assertIn("Normal criteria:", actual)
+            self.assertIn("Normal appearance:", actual)
+            self.assertIn("opposite face instead of the expected face", actual)
+            for defect in ("bent", "color", "flip", "scratch"):
+                self.assertIn(f"- {defect}:", actual)
+            self.assertNotIn("bent_lead", actual)
+            self.assertEqual(actual.count("A. Yes\nB. No"), 1)
+            self.assertEqual(actual.count("Answer with the option's letter"), 1)
+            self.assertEqual(actual.count("<image>"), 1)
+            self.assertNotIn(self.record["text"], actual)
+            self.assertNotIn(self.record["answer"], actual)
+            self.assertNotIn("/test/", actual)
+            self.assertNotIn("gt", self.model.calls[index])
+            self.assertNotIn("labels", self.model.calls[index])
+            self.assertIn(row["question"], actual)
+            self.assertEqual(row["original_question"], self.record["text"])
+        torch.testing.assert_close(self.model.calls[0]["inputs"], self.model.calls[1]["inputs"], rtol=0, atol=0)
+        self.assertEqual([row["anomaly_prediction"] for row in predictions], [1, 0, None])
+        self.assertEqual([row["answer"] for row in predictions], ["A", "B", "A"])
+        self.assertEqual([row["correct"] for row in predictions], [True, True, False])
+        self.assertEqual(metrics["anomaly_prompt"], "category-knowledge-mcq")
+        self.assertAlmostEqual(metrics["accuracy"], 2 / 3)
+        self.assertEqual(metrics["unparseable_anomaly"], 1)
+        self.assertEqual(metrics["anomaly_knowledge"]["sha256"],
+                         hashlib.sha256(CATEGORY_KNOWLEDGE_PATH.read_bytes()).hexdigest())
+        self.assertEqual(metrics["anomaly_knowledge"]["version"], "1.0-draft")
+
+    def test_all_mvtec_categories_pass_through_existing_tokenizer_and_scoring(self):
+        categories = ["bottle", "cable", "capsule", "carpet", "grid", "hazelnut", "leather",
+                      "metal_nut", "pill", "screw", "tile", "toothbrush", "transistor", "wood", "zipper"]
+        records = [{**self.record, "question_id": category, "class": category} for category in categories]
+        predictions, metrics = self.run_infer(records, ["A"] * 15, prompt_mode="category-knowledge-mcq")
+        self.assertEqual(set(metrics["by_category"]), set(categories))
+        self.assertEqual(metrics["accuracy"], 1.0)
+        for index, row in enumerate(predictions):
+            self.assertIn("Possible anomalies:", self.actual_prompt(index))
+            self.assertEqual(self.actual_prompt(index).count("A. Yes\nB. No"), 1)
+            self.assertEqual(row["category"], categories[index])
+
+    def test_unsupported_knowledge_category_fails_before_any_generation(self):
+        with self.assertRaisesRegex(ValueError, "record 1:.*no inspection criteria.*unknown_product"):
+            self.run_infer([self.record, {**self.record, "class": "unknown_product"}], [],
+                           prompt_mode="category-knowledge-mcq")
+        self.assertEqual(self.model.calls, [])
+        self.assertFalse(self.output.exists())
+
+    def test_missing_knowledge_file_fails_before_loading_model(self):
+        with patch("mask_fusion.infer.CATEGORY_KNOWLEDGE_PATH", self.root / "missing.json"), \
+                patch("mask_fusion.infer.load_model") as load_model:
+            with self.assertRaises(FileNotFoundError):
+                main(self.arguments() + ["--eval-task", "anomaly", "--anomaly-prompt", "category-knowledge-mcq"])
+        load_model.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_knowledge_prompt_requires_anomaly_task(self):
+        with patch("mask_fusion.infer.load_model") as load_model, \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit) as error:
+                main(self.arguments() + ["--anomaly-prompt", "category-knowledge-mcq"])
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("requires --eval-task anomaly", stderr.getvalue())
+        load_model.assert_not_called()
 
 
 if __name__ == "__main__":

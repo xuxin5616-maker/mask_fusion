@@ -1,0 +1,200 @@
+{
+  "version": "1.0-draft",
+  "description": "Assistant-authored inspection prompt drafts. Defect names checked against the official taxonomy; descriptions are concise operational interpretations, not official per-image annotations. No performance validation has been performed.",
+  "sources": [
+    {
+      "purpose": "Category and defect-type inventory; Table 8, PDF page 20 (zero-based page 19)",
+      "url": "https://d-nb.info/1226611842/34"
+    },
+    {
+      "purpose": "Related domain-knowledge design and selected term interpretation; not copied wholesale",
+      "url": "https://github.com/jam-cc/MMAD/blob/main/dataset/MMAD/domain_knowledge.json"
+    },
+    {
+      "purpose": "Prior implementation of category descriptions before the anomaly question",
+      "url": "https://github.com/CASIA-LMC-Lab/AnomalyGPT/blob/main/code/test_mvtec.py"
+    }
+  ],
+  "common_prefix": "Use the following product-specific inspection criteria to assess the image. These are possible anomalies, not claims about the current image. Base the decision on visible evidence and assess both surface condition and the relevant structural requirements.",
+  "categories": {
+    "bottle": {
+      "object_name": "bottle",
+      "normal_criteria": "The visible bottle rim should be continuous and intact, with no foreign material in the visible opening or interior.",
+      "normal_appearance": "Glass reflections and variations in transmitted light alone are not defects.",
+      "defects": {
+        "broken_large": "A relatively large chipped or broken region of the bottle rim.",
+        "broken_small": "A small chip or localized break in the bottle rim.",
+        "contamination": "Foreign material, dirt, or an abnormal deposit in the visible bottle region."
+      }
+    },
+    "cable": {
+      "object_name": "cable",
+      "normal_criteria": "The cable cross-section should contain the expected insulated cores and conductor strands, with the expected color configuration and intact inner and outer insulation.",
+      "normal_appearance": "Visible conductor ends at the cable cross-section are expected; their visibility alone is not insulation damage.",
+      "defects": {
+        "bent_wire": "Conductor strands are bent, splayed, or displaced from their expected arrangement.",
+        "cable_swap": "Insulated cores have an incorrect color configuration or placement relative to the expected cable design, even if physically intact.",
+        "combined": "Two or more cable defects occur together.",
+        "cut_inner_insulation": "A cut or tear damages the insulation around an individual conductor core.",
+        "cut_outer_insulation": "A cut or tear damages the cable's outer insulating sheath.",
+        "missing_cable": "An expected insulated core is absent.",
+        "missing_wire": "Conductor strands inside a core are missing or visibly incomplete.",
+        "poke_insulation": "A puncture or localized piercing damages the insulation."
+      }
+    },
+    "capsule": {
+      "object_name": "capsule",
+      "normal_criteria": "The capsule should retain its intended shape, with an intact shell and clear expected printed markings.",
+      "normal_appearance": "The intended two-tone coloring and the joint between capsule sections are not defects by themselves.",
+      "defects": {
+        "crack": "An unintended split in the capsule shell, distinct from its designed joint.",
+        "faulty_imprint": "Expected printed markings are missing, blurred, incomplete, or distorted.",
+        "poke": "A puncture or small localized impact damage affects the shell.",
+        "scratch": "An abrasion or scratch marks the shell surface.",
+        "squeeze": "The capsule is crushed, dented, or otherwise deformed by compression."
+      }
+    },
+    "carpet": {
+      "object_name": "carpet",
+      "normal_criteria": "The carpet should have a continuous, locally consistent weave without damaged areas or foreign objects.",
+      "normal_appearance": "The regular weave and minor fiber shading differences alone are not defects.",
+      "defects": {
+        "color": "A localized stain or color change deviates from the surrounding carpet.",
+        "cut": "Cut fibers create an unintended slit in the weave.",
+        "hole": "Missing material creates an unintended hole.",
+        "metal_contamination": "A foreign metal fragment is on or within the carpet.",
+        "thread": "A stray, loose, or pulled thread disrupts the regular weave."
+      }
+    },
+    "grid": {
+      "object_name": "grid mesh",
+      "normal_criteria": "The mesh should have regularly arranged cells and continuous strands with the expected geometry.",
+      "normal_appearance": "Regular openings are part of the mesh design and are not defects.",
+      "defects": {
+        "bent": "Bent strands or distorted cells disrupt the regular mesh geometry.",
+        "broken": "A mesh strand is broken or missing.",
+        "glue": "An adhesive deposit covers or obstructs part of the mesh.",
+        "metal_contamination": "A foreign metal fragment is attached to or trapped in the mesh.",
+        "thread": "An extra thread or fiber interferes with the mesh pattern."
+      }
+    },
+    "hazelnut": {
+      "object_name": "hazelnut",
+      "normal_criteria": "The shell should be intact, with natural shell texture and brown color variation, without unintended openings or artificial markings.",
+      "normal_appearance": "Natural shell ridges and mild color variation alone are not cracks or contamination.",
+      "defects": {
+        "crack": "An unintended fissure splits the shell.",
+        "cut": "A cut or incision damages the shell.",
+        "hole": "An unintended hole penetrates the shell.",
+        "print": "An artificial printed, inked, or stamped mark appears on the shell."
+      }
+    },
+    "leather": {
+      "object_name": "leather",
+      "normal_criteria": "The leather surface should be continuous, retaining its natural grain without damage, abnormal folds, or foreign deposits.",
+      "normal_appearance": "Natural grain and mild tonal variation alone are not defects.",
+      "defects": {
+        "color": "An abnormal color patch or discoloration affects the leather.",
+        "cut": "A cut or slit breaks the leather surface.",
+        "fold": "An unintended fold or pronounced crease changes the surface geometry.",
+        "glue": "An adhesive deposit or glue residue is present.",
+        "poke": "A puncture or localized piercing damages the leather."
+      }
+    },
+    "metal_nut": {
+      "object_name": "metal nut",
+      "normal_criteria": "The nut should have an intact shape and surface and present the expected face to the camera.",
+      "normal_appearance": "Ordinary in-plane rotation and metallic reflections alone are not defects. Turning the nut over is a different change.",
+      "defects": {
+        "bent": "The nut's outline or structure is bent or deformed.",
+        "color": "Abnormal discoloration or staining affects the metal surface.",
+        "flip": "The nut is turned over and shows the opposite face instead of the expected face. This is an anomaly even without physical damage.",
+        "scratch": "Visible scratches or abrasion marks damage the surface."
+      }
+    },
+    "pill": {
+      "object_name": "pill",
+      "normal_criteria": "The pill should match the expected product type, shape, and markings, with an intact surface and outline.",
+      "normal_appearance": "The expected red speckles and imprinted markings of this product are normal; their presence alone is not contamination.",
+      "defects": {
+        "color": "Abnormal coloration deviates from the expected base color and speckle pattern.",
+        "combined": "Two or more pill defects occur together.",
+        "contamination": "Foreign material or an unintended deposit is present.",
+        "crack": "A fissure or fracture damages the pill.",
+        "faulty_imprint": "Expected imprinted markings are incomplete, unclear, or incorrect.",
+        "pill_type": "The pill is of an incorrect type or design, even if it is physically intact.",
+        "scratch": "An abrasion or scratch affects the pill surface."
+      }
+    },
+    "screw": {
+      "object_name": "screw",
+      "normal_criteria": "The head, neck, tip, and threads should be intact, with a continuous thread pattern and the expected pointed tip.",
+      "normal_appearance": "The intended helical thread pattern, designed features, and metallic reflections alone are not damage.",
+      "defects": {
+        "manipulated_front": "The pointed end is blunted, damaged, or deformed.",
+        "scratch_head": "A scratch damages the screw head.",
+        "scratch_neck": "A scratch damages the neck below the head.",
+        "thread_side": "The side portions of the thread profile are damaged, deformed, or interrupted.",
+        "thread_top": "The top portions of the thread profile are damaged or misshapen."
+      }
+    },
+    "tile": {
+      "object_name": "tile",
+      "normal_criteria": "The tile surface should be intact, with a consistent local granular or speckled texture and no unintended deposits.",
+      "normal_appearance": "The intended granular texture, speckles, and minor texture variation alone are not contamination.",
+      "defects": {
+        "crack": "A fissure or fracture runs through the surface.",
+        "glue_strip": "A strip of adhesive or glue residue covers the surface.",
+        "gray_stroke": "An unintended gray stroke or smear crosses the surface.",
+        "oil": "An oily stain changes the local appearance or reflectance.",
+        "rough": "A localized roughened or abraded patch disrupts the expected surface texture."
+      }
+    },
+    "toothbrush": {
+      "object_name": "toothbrush",
+      "normal_criteria": "The brush head should have intact bristle tufts in their expected arrangement, without damaged regions or foreign material.",
+      "normal_appearance": "Designed bristle color groups and intended length differences alone are not anomalies.",
+      "defects": {
+        "defective": "Bristle defects, such as missing tufts, pronounced bending or disorder, damage, or contamination."
+      }
+    },
+    "transistor": {
+      "object_name": "transistor",
+      "normal_criteria": "The component should have an intact case and leads and occupy the expected position and orientation for this inspection setup.",
+      "normal_appearance": "Lead reflections alone are not damage; distinguish imaging variation from actual component displacement.",
+      "defects": {
+        "bent_lead": "A lead is bent or displaced from its expected shape.",
+        "cut_lead": "A lead is cut short, severed, or missing.",
+        "damaged_case": "The component case is chipped, cracked, or otherwise visibly damaged.",
+        "misplaced": "The component is in an incorrect position or orientation for the inspection setup, even if physically intact."
+      }
+    },
+    "wood": {
+      "object_name": "wood",
+      "normal_criteria": "The wood surface should be intact, showing natural grain and its normal variation in texture and tone.",
+      "normal_appearance": "Natural grain lines and gradual tonal variation alone are not cracks, scratches, or contamination.",
+      "defects": {
+        "color": "An abnormal color patch deviates from the natural grain and tone.",
+        "combined": "Two or more wood defects occur together.",
+        "hole": "An unintended hole or area of missing material is present.",
+        "liquid": "A liquid stain or residue changes the local surface appearance.",
+        "scratch": "An unintended scratch or gouge disrupts the natural grain."
+      }
+    },
+    "zipper": {
+      "object_name": "zipper",
+      "normal_criteria": "The zipper should have intact, regularly arranged teeth with the expected engagement, and undamaged fabric tape.",
+      "normal_appearance": "The intended tooth geometry and regular fabric weave alone are not splitting or damage.",
+      "defects": {
+        "broken_teeth": "One or more teeth are broken or missing.",
+        "combined": "Two or more zipper defects occur together.",
+        "fabric_border": "The fabric border is torn, damaged, or visibly frayed.",
+        "fabric_interior": "Damage or a localized weave disruption affects the interior of the fabric tape.",
+        "rough": "Tooth surfaces or edges are abnormally roughened, worn, or damaged.",
+        "split_teeth": "Teeth that should engage are abnormally separated, creating a split in the tooth chain.",
+        "squeezed_teeth": "Compressed or pinched teeth have abnormal shapes or spacing."
+      }
+    }
+  }
+}
+

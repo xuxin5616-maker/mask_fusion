@@ -2,6 +2,7 @@
 
 import argparse
 from collections import defaultdict
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -17,9 +18,24 @@ from .train import _move, _resolve_dtype, _autocast
 
 
 CATEGORY_MCQ_INSTRUCTION = "Answer with the option's letter from the given choices directly."
+CATEGORY_MCQ_MODES = ("category-mcq", "category-knowledge-mcq")
+CATEGORY_KNOWLEDGE_PATH = Path(__file__).resolve().parent / "prompts" / "mvtec_category_knowledge.json"
 
 
-def category_anomaly_record(record):
+def load_category_knowledge():
+    """Read the bundled category criteria once and record their exact version."""
+    raw = CATEGORY_KNOWLEDGE_PATH.read_bytes()
+    knowledge = json.loads(raw.decode("utf-8-sig"))
+    if not isinstance(knowledge, dict) or not isinstance(knowledge.get("categories"), dict):
+        raise ValueError(f"Invalid category knowledge: {CATEGORY_KNOWLEDGE_PATH}")
+    return knowledge, {
+        "file": str(CATEGORY_KNOWLEDGE_PATH),
+        "version": knowledge["version"],
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def category_anomaly_record(record, *, knowledge=None):
     """Build the requested test-only prompt without using any target label."""
     category = record.get("category")
     if not isinstance(category, str) or not category.strip():
@@ -27,10 +43,31 @@ def category_anomaly_record(record):
     readable_category = " ".join(category.replace("_", " ").split())
     if not readable_category:
         raise ValueError("category-mcq requires a nonempty readable category")
+    question = f"Are there any defects on the {readable_category} in this image?"
+    if knowledge is not None:
+        # Only the product category selects knowledge, never gt, origin_path,
+        # the reference answer, or the image's defect subdirectory.
+        key = readable_category.casefold().replace(" ", "_")
+        if key not in knowledge["categories"]:
+            raise ValueError(
+                f"category-knowledge-mcq has no inspection criteria for category {category!r}; "
+                "use category-mcq for products outside MVTec AD"
+            )
+        entry = knowledge["categories"][key]
+        question = "\n\n".join([
+            knowledge["common_prefix"],
+            f"Product: {entry['object_name']}.",
+            f"Normal criteria: {entry['normal_criteria']}",
+            f"Normal appearance: {entry['normal_appearance']}",
+            "Possible anomalies:\n" + "\n".join(
+                f"- {name}: {description}" for name, description in entry["defects"].items()
+            ),
+            f"Does the {entry['object_name']} in this image show any anomaly under these criteria?",
+        ])
     return {
         **record,
         "original_question": record["question"],
-        "question": f"Are there any defects on the {readable_category} in this image?",
+        "question": question,
         "options": {"A": "Yes", "B": "No"},
         "mcq_instruction": CATEGORY_MCQ_INSTRUCTION,
         # Keep reference answers out of the runtime prompt record. gt is read
@@ -85,8 +122,8 @@ def main(argv=None):
         help="qa: score labeled MCQs; anomaly: score defect judgments against gt=1/0",
     )
     parser.add_argument(
-        "--anomaly-prompt", choices=("original", "category-mcq"), default="original",
-        help="With --eval-task anomaly: keep the original yes/no prompt, or ask the category-specific A=Yes/B=No question",
+        "--anomaly-prompt", choices=("original", *CATEGORY_MCQ_MODES), default="original",
+        help="With --eval-task anomaly: original yes/no, category A/B, or MVTec inspection knowledge followed by A/B",
     )
     parser.add_argument("--output", required=True, help="Predictions JSONL")
     parser.add_argument("--overwrite", action="store_true")
@@ -100,11 +137,14 @@ def main(argv=None):
     if args.max_new_tokens < 1:
         parser.error("max-new-tokens must be positive")
     if args.anomaly_prompt != "original" and args.eval_task != "anomaly":
-        parser.error("--anomaly-prompt category-mcq requires --eval-task anomaly")
+        parser.error(f"--anomaly-prompt {args.anomaly_prompt} requires --eval-task anomaly")
     output = Path(args.output)
     metrics_path = output.with_suffix(".metrics.json")
     if not args.overwrite and (output.exists() or metrics_path.exists()):
         raise FileExistsError("Output already exists; choose another path or use --overwrite")
+    knowledge, knowledge_metadata = None, None
+    if args.anomaly_prompt == "category-knowledge-mcq":
+        knowledge, knowledge_metadata = load_category_knowledge()
     metadata = read_adapter_config(args.adapter)
     base = args.base_model or metadata["base_model"]
     device = torch.device(args.device)
@@ -129,8 +169,8 @@ def main(argv=None):
         for index, record in enumerate(dataset.records):
             try:
                 validate_anomaly_target(record)
-                if args.anomaly_prompt == "category-mcq":
-                    dataset.records[index] = category_anomaly_record(record)
+                if args.anomaly_prompt in CATEGORY_MCQ_MODES:
+                    dataset.records[index] = category_anomaly_record(record, knowledge=knowledge)
                 elif record["options"] is not None:
                     raise ValueError("anomaly scoring requires yes/no prompts without options; use --eval-task qa for MCQs")
             except ValueError as error:
@@ -162,7 +202,7 @@ def main(argv=None):
                 "correct": ((choice == expected) if expected is not None and record["options"] else None),
             }
             if args.eval_task == "anomaly":
-                if args.anomaly_prompt == "category-mcq":
+                if args.anomaly_prompt in CATEGORY_MCQ_MODES:
                     predicted_label = {"A": 1, "B": 0}.get(choice)
                     result.update({
                         "original_question": record["original_question"],
@@ -189,6 +229,8 @@ def main(argv=None):
                     "input_records": len(dataset) + len(dataset.skipped_records),
                     "skipped_missing_images": len(dataset.skipped_records),
                     "skipped_records": dataset.skipped_records})
+    if knowledge_metadata is not None:
+        metrics["anomaly_knowledge"] = knowledge_metadata
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
