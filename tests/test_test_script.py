@@ -24,7 +24,8 @@ class MVTecTestScriptTests(unittest.TestCase):
         child_env = os.environ.copy()
         for key in ("DATA_ROOT", "TEST_DATA", "ADAPTER", "BASE_MODEL", "ANOMALY_PROMPT",
                     "OUTPUT_FILE", "PYTHON_BIN", "CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS",
-                    "DTYPE", "ATTN_IMPLEMENTATION", "SEED", "MAX_NEW_TOKENS", "MAX_TEXT_LENGTH"):
+                    "DTYPE", "ATTN_IMPLEMENTATION", "SEED", "MAX_NEW_TOKENS", "MAX_TEXT_LENGTH",
+                    "VISUALIZE", "VISUALIZATION_DIR", "VISUALIZATION_LIMIT"):
             child_env.pop(key, None)
         child_env.update({"DRY_RUN": "1", "PYTHON_BIN": "/missing/python with spaces"})
         child_env.update(env or {})
@@ -53,6 +54,8 @@ class MVTecTestScriptTests(unittest.TestCase):
         for key, value in expected.items():
             self.assertEqual(command[command.index(key) + 1], value)
         self.assertNotIn("--overwrite", command)
+        self.assertIn("--visualize", command)
+        self.assertEqual(command[command.index("--visualization-limit") + 1], "0")
 
     def test_environment_overrides_paths_with_spaces_and_baseline_output(self):
         root, command = self.dry_run({
@@ -66,6 +69,14 @@ class MVTecTestScriptTests(unittest.TestCase):
         self.assertEqual(command[command.index("--anomaly-prompt") + 1], "category-mcq")
         self.assertEqual(command[command.index("--output") + 1], root + "/results/mvtec_category_mcq.jsonl")
         self.assertEqual(command[-2:], ["--max-new-tokens", "128"])
+
+    def test_visualization_controls_and_path_with_spaces(self):
+        _, command = self.dry_run({"VISUALIZE": "0"})
+        self.assertNotIn("--visualize", command)
+        self.assertNotIn("--visualization-dir", command)
+        _, command = self.dry_run({"VISUALIZATION_DIR": "/results/my previews", "VISUALIZATION_LIMIT": "20"})
+        self.assertEqual(command[command.index("--visualization-dir") + 1], "/results/my previews")
+        self.assertEqual(command[command.index("--visualization-limit") + 1], "20")
 
 
 if __name__ == "__main__":

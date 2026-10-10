@@ -108,7 +108,7 @@
       "defects": {
         "bent": "The nut's outline or structure is bent or deformed.",
         "color": "Abnormal discoloration or staining affects the metal surface.",
-        "flip": "The nut is turned over and shows the opposite face instead of the expected face. This is an anomaly even without physical damage.",
+        "flip": "The nut shows its smooth face.",
         "scratch": "Visible scratches or abrasion marks damage the surface."
       }
     },

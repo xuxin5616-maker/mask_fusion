@@ -57,6 +57,10 @@ def load_baseline_without_models():
     if importlib.util.find_spec("cv2") is None:
         # Explicit-box ROI and random-patch tests do not call OpenCV.
         replacements["cv2"] = ModuleType("cv2")
+    else:
+        # Import native extensions outside patch.dict: clearing a freshly
+        # imported cv2 from sys.modules makes subsequent tests reinitialize it.
+        importlib.import_module("cv2")
     with patch.dict(sys.modules, replacements):
         spec.loader.exec_module(module)
     return module

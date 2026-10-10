@@ -3,6 +3,8 @@
 # 运行：bash scripts/test_mvtec.sh
 # 预览命令（不加载模型）：DRY_RUN=1 bash scripts/test_mvtec.sh
 # 原 A/B 对照：ANOMALY_PROMPT=category-mcq bash scripts/test_mvtec.sh
+# 默认保存原图、实际 ROI/AnyRes 分块和连续 mask；VISUALIZE=0 可关闭。
+# 只保存前 N 条：VISUALIZATION_LIMIT=20；默认 0 保存全部。
 # 可用环境变量覆盖路径，也可追加 --adapter /path/to/adapter 等推理参数。
 set -euo pipefail
 
@@ -36,6 +38,13 @@ command=(
     --max-new-tokens "${MAX_NEW_TOKENS:-64}"
     --max-text-length "${MAX_TEXT_LENGTH:-2048}"
 )
+if [[ "${VISUALIZE:-1}" == "1" ]]; then
+    command+=(--visualize)
+fi
+if [[ -n "${VISUALIZATION_DIR:-}" ]]; then
+    command+=(--visualization-dir "${VISUALIZATION_DIR}")
+fi
+command+=(--visualization-limit "${VISUALIZATION_LIMIT:-0}")
 command+=("$@")
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then

@@ -359,6 +359,9 @@ class QADataset(Dataset):
         )
         for name in ("images", "masks", "mask_valid", "image_size"):
             sample[name] = prepared[name]
+        if not self.training and "metadata" in prepared:
+            # Diagnostics only; collate_samples never forwards this to the LLM.
+            sample["preprocessing_metadata"] = prepared["metadata"]
         return sample
 
 

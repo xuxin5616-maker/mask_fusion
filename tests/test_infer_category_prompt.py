@@ -185,7 +185,7 @@ class CategoryPromptInferenceTests(unittest.TestCase):
             actual = self.actual_prompt(index)
             self.assertIn("Normal criteria:", actual)
             self.assertIn("Normal appearance:", actual)
-            self.assertIn("opposite face instead of the expected face", actual)
+            self.assertIn("- flip: The nut shows its smooth face.", actual)
             for defect in ("bent", "color", "flip", "scratch"):
                 self.assertIn(f"- {defect}:", actual)
             self.assertNotIn("bent_lead", actual)

@@ -133,15 +133,29 @@ def main(argv=None):
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--max-text-length", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--visualize", action=argparse.BooleanOptionalAction, default=False,
+                        help="Save actual image/mask input views alongside predictions")
+    parser.add_argument("--visualization-dir", help="Save visualizations here (also enables them); must be empty/new")
+    parser.add_argument("--visualization-limit", type=int, default=0,
+                        help="Visualize the first N retained QA records; 0 saves all")
     args = parser.parse_args(argv)
     if args.max_new_tokens < 1:
         parser.error("max-new-tokens must be positive")
     if args.anomaly_prompt != "original" and args.eval_task != "anomaly":
         parser.error(f"--anomaly-prompt {args.anomaly_prompt} requires --eval-task anomaly")
+    if args.visualization_limit < 0:
+        parser.error("--visualization-limit must be nonnegative")
     output = Path(args.output)
     metrics_path = output.with_suffix(".metrics.json")
     if not args.overwrite and (output.exists() or metrics_path.exists()):
         raise FileExistsError("Output already exists; choose another path or use --overwrite")
+    visualization_dir = None
+    if args.visualize or args.visualization_dir:
+        visualization_dir = (Path(args.visualization_dir) if args.visualization_dir else
+                             output.with_name(output.stem + "_visualizations")).resolve()
+        if visualization_dir.exists() and (not visualization_dir.is_dir() or any(visualization_dir.iterdir())):
+            raise FileExistsError("Visualization directory is not empty; choose a new --output or --visualization-dir")
+        from .visualization import save_input_visualization
     knowledge, knowledge_metadata = None, None
     if args.anomaly_prompt == "category-knowledge-mcq":
         knowledge, knowledge_metadata = load_category_knowledge()
@@ -178,11 +192,23 @@ def main(argv=None):
                 raise ValueError(f"{source['source_file']}: record {source['source_index']}: {error}") from error
     output.parent.mkdir(parents=True, exist_ok=True)
     predictions = []
+    visualization_count = 0
+    visualization_score_max = float(metadata.get("fusion_config", {}).get("score_scale", 255.0))
     with output.open("w", encoding="utf-8") as handle, torch.inference_mode():
         # One prompt per call avoids decoder-only right-padding generation ambiguity.
         for index in range(len(dataset)):
             record = dataset.records[index]
-            batch = _move(collate_samples([dataset[index]], tokenizer.pad_token_id), device)
+            # Prepare exactly once: random ROI selection must be shared by the
+            # model and its diagnostic images, not independently rerun.
+            sample = dataset[index]
+            visualization = None
+            if visualization_dir is not None and (args.visualization_limit == 0 or index < args.visualization_limit):
+                visualization = save_input_visualization(
+                    sample, record, dataset.sources[index], processor, visualization_dir, index,
+                    score_max=visualization_score_max,
+                )
+                visualization_count += 1
+            batch = _move(collate_samples([sample], tokenizer.pad_token_id), device)
             input_ids = batch.pop("input_ids")
             with _autocast(device, dtype):
                 generated = model.generate(
@@ -201,6 +227,8 @@ def main(argv=None):
                 "prediction": answer, "choice": choice, "answer": expected,
                 "correct": ((choice == expected) if expected is not None and record["options"] else None),
             }
+            if visualization is not None:
+                result["visualization"] = visualization
             if args.eval_task == "anomaly":
                 if args.anomaly_prompt in CATEGORY_MCQ_MODES:
                     predicted_label = {"A": 1, "B": 0}.get(choice)
@@ -231,6 +259,9 @@ def main(argv=None):
                     "skipped_records": dataset.skipped_records})
     if knowledge_metadata is not None:
         metrics["anomaly_knowledge"] = knowledge_metadata
+    if visualization_dir is not None:
+        metrics["visualization"] = {"directory": str(visualization_dir), "records": visualization_count,
+                                    "limit": args.visualization_limit, "score_max": visualization_score_max}
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 

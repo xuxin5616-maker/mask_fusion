@@ -369,6 +369,30 @@ GPU 0 和 bfloat16。图像模式从 adapter 配置读取；若保存的是 `ran
 
 - `results/mvtec_category_knowledge_mcq.jsonl`：每条预测及实际使用的知识题干。
 - `results/mvtec_category_knowledge_mcq.metrics.json`：原有准确率、混淆统计、各类别指标，另记录知识文件版本和 SHA-256。
+- `results/mvtec_category_knowledge_mcq_visualizations/`：实际输入的图像、连续 mask 和选区可视化，脚本默认保存全部样本。
+
+可视化按本次数据顺序创建 `00000000/`、`00000001/` 等目录，避免重复 ID 覆盖。
+先打开其中的 `overview.jpg`：第一行显示原图上的实际选框、原始 mask 热图和叠加图；
+后续每行按模型输入顺序显示 base、ROI 或 AnyRes tile，以及对应 mask 和叠加图。
+`view_XX_*_image.png` 由本次输入张量反归一化得到；可视化不会重新随机抽取 ROI。
+AnyRes 的选框从 padding 画布坐标映射回原图，精确坐标保存在 `metadata.json` 中。
+热图统一使用 `[0, fusion_config.score_scale]`（默认 0–255），不做逐图 min-max，灰色表示无效 padding。
+`mask_values.npz` 保存实际输入的浮点 `masks`、布尔 `mask_valid` 以及原分辨率的 `source_mask`；
+显示时超出色标范围的值会饱和，但保存的浮点数和模型输入不变。每条预测中记录对应的可视化路径。
+
+```bash
+# 不加知识提示，保存实际输入可视化，使用新的结果名
+ANOMALY_PROMPT=category-mcq OUTPUT_FILE=results/mvtec_inputs.jsonl bash scripts/test_mvtec.sh
+# 仅保存前 20 条的可视化（仍对整个测试集进行推理）
+VISUALIZATION_LIMIT=20 OUTPUT_FILE=results/mvtec_preview.jsonl bash scripts/test_mvtec.sh
+# 关闭可视化
+VISUALIZE=0 bash scripts/test_mvtec.sh
+```
+
+可设置 `VISUALIZATION_DIR` 指定一个新的可视化目录；默认目录跟随最终 `--output` 的文件名。
+目录必须为空或不存在，避免混入旧实验图片，`--overwrite` 不会放宽此检查。
+直接使用 `python -m mask_fusion.infer` 时，可追加 `--visualize`、`--visualization-dir` 和 `--visualization-limit`。
+这项功能沿用 adapter 保存的图像模式，不会将 ROI 权重自动切换成 AnyRes。
 
 仅预览命令、切换权重或与原 A/B 提示对照：
 
