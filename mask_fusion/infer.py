@@ -14,6 +14,7 @@ from .anomaly_metrics import (
     extract_anomaly_prediction, summarize_anomaly_predictions, validate_anomaly_target,
 )
 from .model import load_model, read_adapter_config
+from .progress import ProgressTimer
 from .train import _move, _resolve_dtype, _autocast
 
 
@@ -194,6 +195,7 @@ def main(argv=None):
     predictions = []
     visualization_count = 0
     visualization_score_max = float(metadata.get("fusion_config", {}).get("score_scale", 255.0))
+    timer = ProgressTimer(len(dataset))
     with output.open("w", encoding="utf-8") as handle, torch.inference_mode():
         # One prompt per call avoids decoder-only right-padding generation ambiguity.
         for index in range(len(dataset)):
@@ -201,13 +203,6 @@ def main(argv=None):
             # Prepare exactly once: random ROI selection must be shared by the
             # model and its diagnostic images, not independently rerun.
             sample = dataset[index]
-            visualization = None
-            if visualization_dir is not None and (args.visualization_limit == 0 or index < args.visualization_limit):
-                visualization = save_input_visualization(
-                    sample, record, dataset.sources[index], processor, visualization_dir, index,
-                    score_max=visualization_score_max,
-                )
-                visualization_count += 1
             batch = _move(collate_samples([sample], tokenizer.pad_token_id), device)
             input_ids = batch.pop("input_ids")
             with _autocast(device, dtype):
@@ -227,8 +222,6 @@ def main(argv=None):
                 "prediction": answer, "choice": choice, "answer": expected,
                 "correct": ((choice == expected) if expected is not None and record["options"] else None),
             }
-            if visualization is not None:
-                result["visualization"] = visualization
             if args.eval_task == "anomaly":
                 if args.anomaly_prompt in CATEGORY_MCQ_MODES:
                     predicted_label = {"A": 1, "B": 0}.get(choice)
@@ -243,10 +236,20 @@ def main(argv=None):
                     "gt": record["gt"], "anomaly_prediction": predicted_label,
                     "correct": predicted_label == record["gt"],
                 })
+            # Annotate only after generation/scoring. Ground truth is display
+            # metadata and is never added to model inputs or crop selection.
+            if visualization_dir is not None and (args.visualization_limit == 0 or index < args.visualization_limit):
+                result["visualization"] = save_input_visualization(
+                    sample, record, dataset.sources[index], processor, visualization_dir, index,
+                    score_max=visualization_score_max, prediction_result=result,
+                )
+                visualization_count += 1
             predictions.append(result)
             handle.write(json.dumps(result, ensure_ascii=False) + "\n")
             handle.flush()
-            print(f"[{index + 1}/{len(dataset)}] {record['id']}: {answer}", flush=True)
+            progress = timer.snapshot(index + 1)
+            print(f"[{index + 1}/{len(dataset)}] elapsed={progress['elapsed']} "
+                  f"ETA={progress['eta']} {record['id']}: {answer}", flush=True)
     metrics = (summarize_anomaly_predictions(predictions) if args.eval_task == "anomaly"
                else summarize_predictions(predictions))
     metrics.update({"adapter": str(Path(args.adapter).resolve()), "base_model": str(base),
@@ -257,6 +260,7 @@ def main(argv=None):
                     "input_records": len(dataset) + len(dataset.skipped_records),
                     "skipped_missing_images": len(dataset.skipped_records),
                     "skipped_records": dataset.skipped_records})
+    metrics["inference_progress"] = {"progress_unit": "record", **timer.snapshot()}
     if knowledge_metadata is not None:
         metrics["anomaly_knowledge"] = knowledge_metadata
     if visualization_dir is not None:

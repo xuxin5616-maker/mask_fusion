@@ -372,6 +372,10 @@ GPU 0 和 bfloat16。图像模式从 adapter 配置读取；若保存的是 `ran
 - `results/mvtec_category_knowledge_mcq_visualizations/`：实际输入的图像、连续 mask 和选区可视化，脚本默认保存全部样本。
 
 可视化按本次数据顺序创建 `00000000/`、`00000001/` 等目录，避免重复 ID 覆盖。
+`overview.jpg` 顶部显示真实标签 `GT: NORMAL/ABNORMAL`、模型判断 `Model: NORMAL/ABNORMAL`，
+以及 `CORRECT`（绿色）、`INCORRECT`（红色）或 `UNPARSED`（橙色，模型输出无法解析）。
+同时显示模型原始回答的预览，完整回答与标签保存在 `metadata.json` 的 `prediction_result` 中。
+标注发生在模型生成和评分之后，真实标签不会进入模型输入；单独保存的输入图片不添加文字。
 先打开其中的 `overview.jpg`：第一行显示原图上的实际选框、原始 mask 热图和叠加图；
 后续每行按模型输入顺序显示 base、ROI 或 AnyRes tile，以及对应 mask 和叠加图。
 `view_XX_*_image.png` 由本次输入张量反归一化得到；可视化不会重新随机抽取 ROI。

@@ -10,12 +10,12 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 import torch
 
 from mask_fusion.infer import main
 from mask_fusion.preprocessing import prepare_image_mask
-from mask_fusion.visualization import restore_rgb_views, save_input_visualization, score_heatmap
+from mask_fusion.visualization import prediction_display, restore_rgb_views, save_input_visualization, score_heatmap
 from test_data import fake_image_tokenize
 from test_infer_anomaly import DecodeTokenizer, RecordingModel
 from test_preprocessing import FakeProcessor, load_baseline_without_models
@@ -117,6 +117,34 @@ class VisualizationTests(unittest.TestCase):
         np.testing.assert_array_equal(one[:, :2], two[:, :2])
         self.assertFalse(np.array_equal(one[:, 2], two[:, 2]))
 
+    def test_overview_draws_ground_truth_prediction_and_preserves_full_response(self):
+        scores = np.full((56, 56), 12.125, dtype=np.float32)
+        sample, record = self.make_sample(Image.new("RGB", (56, 56), "white"), scores, "square")
+        raw_response = "No, this looks normal. " * 50
+        result = {"gt": 1, "anomaly_prediction": 0, "correct": False, "prediction": raw_response}
+        with patch("mask_fusion.visualization.ImageDraw.ImageDraw.text", autospec=True,
+                   side_effect=ImageDraw.ImageDraw.text) as rendered_text:
+            paths = save_input_visualization(sample, record, {}, self.processor, self.root / "vis", 0,
+                                             prediction_result=result)
+        texts = [call.args[2] for call in rendered_text.call_args_list]
+        self.assertIn("GT: ABNORMAL | Model: NORMAL | INCORRECT", texts)
+        preview = next(text for text in texts if text.startswith("Model response:"))
+        self.assertTrue(preview.endswith("..."))
+        details = json.loads(Path(paths["metadata"]).read_text(encoding="utf-8"))
+        self.assertEqual(details["prediction_result"]["prediction"], raw_response)
+        self.assertEqual(details["prediction_result"]["gt"], 1)
+        with Image.open(Path(paths["directory"]) / "view_00_base_image.png") as image:
+            self.assertEqual(image.size, (56, 56))
+            self.assertTrue(np.all(np.asarray(image) == 255))
+
+    def test_binary_display_uses_scored_label_and_does_not_guess_qa_choice(self):
+        normal = prediction_display({"gt": 0, "anomaly_prediction": 0, "correct": True,
+                                     "choice": "A", "prediction": "A"})
+        self.assertEqual(normal["model_judgment_text"], "NORMAL")
+        self.assertEqual(normal["status"], "CORRECT")
+        qa = prediction_display({"answer": "A", "choice": "A", "prediction": "A", "correct": True})
+        self.assertNotIn("model_judgment_text", qa)
+
     def test_inference_prepares_once_and_visualization_does_not_change_inputs(self):
         pixels = np.full((420, 512, 3), 140, dtype=np.uint8)
         scores = np.linspace(0.125, 255.125, 420 * 512, dtype=np.float32).reshape(420, 512)
@@ -127,12 +155,12 @@ class VisualizationTests(unittest.TestCase):
         record = {"id": "duplicate", "image": str(image_path), "mask": str(mask_path),
                   "question": "Is it defective?", "class": "metal_nut", "gt": 1}
         manifest = self.root / "qa.json"
-        manifest.write_text(json.dumps([record, record]), encoding="utf-8")
+        manifest.write_text(json.dumps([record, {**record, "gt": 0}, record]), encoding="utf-8")
         tokenizer = DecodeTokenizer()
         calls = []
         for label, extra in (("off", []), ("on", ["--visualize"]),
                              ("limited", ["--visualize", "--visualization-limit", "1"])):
-            model = RecordingModel(["A", "A"], tokenizer)
+            model = RecordingModel(["A", "A", "I cannot decide."], tokenizer)
             model.config = self.config
             destination = self.root / f"{label}.jsonl"
             with contextlib.ExitStack() as stack:
@@ -146,25 +174,34 @@ class VisualizationTests(unittest.TestCase):
                 main(["--adapter", "fake", "--data", str(manifest), "--output", str(destination),
                       "--device", "cpu", "--dtype", "float32", "--eval-task", "anomaly",
                       "--anomaly-prompt", "category-mcq", "--seed", "7", *extra])
-                self.assertEqual(prepare_mock.call_count, 2)
+                self.assertEqual(prepare_mock.call_count, 3)
             rows = [json.loads(line) for line in destination.read_text(encoding="utf-8").splitlines()]
             metrics = json.loads(destination.with_suffix(".metrics.json").read_text(encoding="utf-8"))
             calls.append(model.calls)
-            self.assertEqual(len(rows), 2)
-            self.assertEqual(metrics["accuracy"], 1)
+            self.assertEqual(len(rows), 3)
+            self.assertAlmostEqual(metrics["accuracy"], 1 / 3)
             if label == "off":
                 self.assertNotIn("visualization", metrics)
             else:
-                count = 1 if label == "limited" else 2
+                count = 1 if label == "limited" else 3
                 self.assertEqual(metrics["visualization"]["records"], count)
                 for index in range(count):
                     self.assertEqual(Path(rows[index]["visualization"]["directory"]).name, f"{index:08d}")
                     with np.load(rows[index]["visualization"]["mask_values"]) as archive:
                         np.testing.assert_array_equal(archive["masks"], model.calls[index]["masks"][0].numpy())
+                    details = json.loads(Path(rows[index]["visualization"]["metadata"]).read_text(encoding="utf-8"))
+                    decision = details["prediction_result"]
+                    self.assertEqual(decision["status"], ("CORRECT", "INCORRECT", "UNPARSED")[index])
+                    self.assertEqual(decision["ground_truth_text"], ("ABNORMAL", "NORMAL", "ABNORMAL")[index])
+                    self.assertEqual(decision["model_judgment_text"], ("ABNORMAL", "ABNORMAL", "UNPARSED")[index])
+                    for key in ("gt", "anomaly_prediction", "prediction", "correct"):
+                        self.assertEqual(decision[key], rows[index][key])
                 if count == 1:
                     self.assertNotIn("visualization", rows[1])
             for actual in model.calls:
                 self.assertNotIn("preprocessing_metadata", actual)
+                self.assertNotIn("gt", actual)
+                self.assertNotIn("correct", actual)
         for other in calls[1:]:
             for original, visualized in zip(calls[0], other):
                 for key in ("inputs", "attention_mask"):

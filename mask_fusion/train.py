@@ -1,4 +1,4 @@
-"""Single-device or torchrun/FSDP training with resumable adapter checkpoints."""
+"""Single-device, FSDP or DeepSpeed ZeRO-3 SFT with resumable adapters."""
 from __future__ import annotations
 
 import argparse
@@ -16,6 +16,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from .data import QADataset, collate_samples, normalize_data_paths
+from .progress import ProgressTimer
 
 
 def parse_args(argv=None):
@@ -41,7 +42,8 @@ def parse_args(argv=None):
     parser.add_argument("--max-text-length", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--distributed", choices=("none", "fsdp"), default="none", help="fsdp requires torchrun with multiple CUDA processes and uses FULL_SHARD")
+    parser.add_argument("--distributed", choices=("none", "fsdp", "deepspeed"), default="none", help="fsdp/deepspeed require torchrun with multiple CUDA processes; use FULL_SHARD/ZeRO-3")
+    parser.add_argument("--deepspeed-config", help="ZeRO-3 JSON; defaults to configs/zero3.json for --distributed deepspeed")
     parser.add_argument("--dtype", choices=("auto", "bfloat16", "float16", "float32"), default="auto")
     parser.add_argument("--attn-implementation", default="sdpa")
     parser.add_argument("--num-workers", type=int, default=0)
@@ -61,6 +63,8 @@ def parse_args(argv=None):
         parser.error("warmup-ratio must be in [0, 1), and weight-decay must be nonnegative")
     if args.require_disjoint_categories and not args.val_data:
         parser.error("--require-disjoint-categories requires --val-data")
+    if args.deepspeed_config and args.distributed != "deepspeed":
+        parser.error("--deepspeed-config requires --distributed deepspeed")
     # Preserve the existing single-file argument/metadata representation.
     # Multi-file order is meaningful for deterministic shuffle and resume.
     for name in ("data", "val_data"):
@@ -246,6 +250,13 @@ def _load_training_state(path: Path):
 
 
 def _save_checkpoint(model, tokenizer, output, args, optimizer, scheduler, scaler, signature, *, epoch, next_batch, global_step, best_val_loss, consecutive_overflows=0, context=None):
+    if getattr(args, "distributed", "none") == "deepspeed":
+        from .deepspeed_backend import save_checkpoint
+
+        return save_checkpoint(model, tokenizer, output, args, signature,
+                               epoch=epoch, next_batch=next_batch, global_step=global_step,
+                               best_val_loss=best_val_loss, consecutive_overflows=consecutive_overflows,
+                               context=context)
     from .model import save_adapter
 
     output = Path(output)
@@ -327,6 +338,7 @@ def evaluate(model, dataset, args, pad_token_id, device, dtype, context=None):
         world_size=context.world_size if context else 1, shuffle=False,
     )
     loader = _loader(dataset, indices, args, pad_token_id, 0)
+    timer = ProgressTimer(len(loader))
     with torch.no_grad():
         for batch_index, batch in enumerate(loader):
             batch = _move(batch, device)
@@ -345,6 +357,10 @@ def evaluate(model, dataset, args, pad_token_id, device, dtype, context=None):
                 raise RuntimeError("Nonfinite validation loss")
             loss_sum += float(loss.item()) * count
             token_count += count
+            completed = batch_index + 1
+            if completed == 1 or completed % getattr(args, "log_every", 10) == 0 or completed == len(loader):
+                _rank_zero_print({"event": "validation_progress", "progress_unit": "batch",
+                                 **timer.snapshot(completed)}, context)
     if context is not None:
         totals = torch.tensor([loss_sum, token_count], device=device, dtype=torch.float64)
         torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
@@ -358,15 +374,19 @@ def main(argv=None):
     args = parse_args(argv)
     # argparse exits for --help before CUDA checks or collective initialization.
     context = None
-    if args.distributed == "fsdp":
+    if args.distributed in ("fsdp", "deepspeed"):
         if torch.device(args.device).type != "cuda":
-            raise ValueError("--distributed fsdp requires CUDA; use torchrun --nproc_per_node=2")
+            raise ValueError(f"--distributed {args.distributed} requires CUDA; use torchrun --nproc_per_node=2")
+        if args.distributed == "deepspeed":
+            from .deepspeed_backend import require_deepspeed
+
+            require_deepspeed()
         from .distributed import initialize_distributed
 
-        context = initialize_distributed()
+        context = initialize_distributed(strategy=args.distributed)
         args.device = str(context.device)
     elif int(os.environ.get("WORLD_SIZE", "1")) > 1:
-        raise ValueError("torchrun multi-process training requires --distributed fsdp; otherwise processes would overwrite one output")
+        raise ValueError("torchrun multi-process training requires --distributed fsdp or deepspeed; otherwise processes would overwrite one output")
     try:
         _run_training(args, context)
     finally:
@@ -384,6 +404,9 @@ def _run_training(args, context=None):
         if device.index is not None:
             torch.cuda.set_device(device.index)
     dtype_name, dtype = _resolve_dtype(args.dtype, device)
+    use_deepspeed = args.distributed == "deepspeed"
+    if use_deepspeed and context is None:
+        raise ValueError("DeepSpeed requires a torchrun distributed context")
     _seed_everything(args.seed, context)
     output = Path(args.output).resolve()
 
@@ -399,7 +422,15 @@ def _run_training(args, context=None):
         if not isinstance(fusion_config, dict):
             raise ValueError("fusion-config must contain a JSON object")
     # Resume explicitly reloads trainable weights as well as optimizer and RNG.
-    resume_state, resume_optimizer = _load_resume_state(Path(args.resume) / "training_state.pt", context) if args.resume else (None, None)
+    if use_deepspeed and args.resume:
+        from .deepspeed_backend import load_resume_metadata
+
+        resume_state, resume_optimizer = load_resume_metadata(args.resume, context), None
+    else:
+        resume_state, resume_optimizer = _load_resume_state(Path(args.resume) / "training_state.pt", context) if args.resume else (None, None)
+    _rank_zero_print({"event": "model_loading", "distributed": args.distributed,
+                     "load_device": "cpu" if context else str(device),
+                     "message": "Each rank reads the base checkpoint; GPU parameter sharding follows loading." if context else "Loading base checkpoint."}, context)
     deferred = {"defer_device": True} if context is not None else {}
     model, tokenizer, processor = load_model(
         args.base_model, fusion_config=fusion_config, adapter_path=args.resume,
@@ -439,7 +470,7 @@ def _run_training(args, context=None):
     # Save the original global count before parameters become local FSDP shards.
     trainable_parameter_count = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     original_model = model
-    if context is not None:
+    if args.distributed == "fsdp":
         from .distributed import wrap_model
 
         model = wrap_model(model, device=device, dtype=dtype)
@@ -460,10 +491,11 @@ def _run_training(args, context=None):
     if not groups["projector"]:
         raise RuntimeError("The entire pretrained projector must be trainable")
     trainable = groups["fusion"] + groups["projector"]
-    optimizer = torch.optim.AdamW(
-        [{"params": groups["fusion"], "lr": args.lr}, {"params": groups["projector"], "lr": args.projector_lr}],
-        weight_decay=args.weight_decay,
-    )
+    parameter_groups = [{"params": groups["fusion"], "lr": args.lr, "name": "fusion"},
+                        {"params": groups["projector"], "lr": args.projector_lr, "name": "projector"}]
+    if use_deepspeed:
+        parameter_groups = [group for group in parameter_groups if group["params"]]
+    optimizer = torch.optim.AdamW(parameter_groups, weight_decay=args.weight_decay)
     samples_per_rank = math.ceil(len(dataset) / (context.world_size if context else 1))
     batches_per_epoch = math.ceil(samples_per_rank / args.batch_size)
     total_steps = math.ceil(batches_per_epoch / args.grad_accum) * args.epochs
@@ -476,13 +508,23 @@ def _run_training(args, context=None):
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_multiplier)
-    if context is not None:
+    ds_config = None
+    if use_deepspeed:
+        from .deepspeed_backend import initialize_engine, resolve_config
+
+        ds_config = resolve_config(args, dtype_name, context.world_size, model.config.hidden_size)
+        model, optimizer, scheduler = initialize_engine(model, optimizer, scheduler, ds_config, device, dtype)
+        _seed_everything(args.seed + context.rank, context)
+        scaler = None  # DeepSpeed owns precision, gradient clipping and optimizer stepping.
+    elif context is not None:
         from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 
         scaler = ShardedGradScaler(enabled=dtype == torch.float16)
     else:
         scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda" and dtype == torch.float16)
     signature = _run_signature(args, len(dataset), total_steps, dtype_name, context)
+    if use_deepspeed:
+        signature["deepspeed_config"] = ds_config
     start_epoch, start_batch, global_step = 0, 0, 0
     best_val_loss = float("inf")
     consecutive_overflows = 0
@@ -495,7 +537,11 @@ def _run_training(args, context=None):
         if saved_signature != signature:
             differences = [key for key in signature if signature[key] != saved_signature.get(key)]
             raise ValueError(f"Resume settings/data differ from checkpoint: {', '.join(differences)}")
-        if context is not None:
+        if use_deepspeed:
+            from .deepspeed_backend import restore_checkpoint
+
+            restore_checkpoint(model, args.resume, resume_state)
+        elif context is not None:
             from .distributed import restore_optimizer_state
 
             restore_optimizer_state(model, optimizer, resume_optimizer)
@@ -503,8 +549,9 @@ def _run_training(args, context=None):
             optimizer.load_state_dict(resume_optimizer)
         resume_state.pop("optimizer", None)
         del resume_optimizer
-        scheduler.load_state_dict(resume_state["scheduler"])
-        scaler.load_state_dict(resume_state["scaler"])
+        if not use_deepspeed:
+            scheduler.load_state_dict(resume_state["scheduler"])
+            scaler.load_state_dict(resume_state["scaler"])
         start_epoch, start_batch = int(resume_state["epoch"]), int(resume_state["next_batch"])
         global_step, best_val_loss = int(resume_state["global_step"]), resume_state["best_val_loss"]
         consecutive_overflows = int(resume_state.get("consecutive_overflows", 0))
@@ -523,10 +570,15 @@ def _run_training(args, context=None):
         output.mkdir(parents=True, exist_ok=True)
         with (output / "training_args.json").open("w", encoding="utf-8") as handle:
             json.dump(vars(args), handle, indent=2, ensure_ascii=False)
+        if ds_config is not None:
+            (output / "deepspeed_config.json").write_text(json.dumps(ds_config, indent=2), encoding="utf-8")
 
     _rank_zero_action(write_args, context)
     _rank_zero_print({"event": "train_start", "qa_records": len(dataset), "unique_images": len({r['image'] for r in dataset.records}), "trainable_parameters": trainable_parameter_count, "total_steps": total_steps, "resume_step": global_step, "dtype": dtype_name, "distributed": args.distributed, "world_size": context.world_size if context else 1, "effective_batch_size": args.batch_size * args.grad_accum * (context.world_size if context else 1), "repeated_samples_per_epoch": samples_per_rank * (context.world_size if context else 1) - len(dataset)}, context)
-    optimizer.zero_grad(set_to_none=True)
+    if not use_deepspeed:
+        optimizer.zero_grad(set_to_none=True)
+    timer = ProgressTimer(args.epochs * batches_per_epoch,
+                          start_epoch * batches_per_epoch + start_batch)
     for epoch in range(start_epoch, args.epochs):
         dataset.set_epoch(epoch)
         order, _ = _distributed_indices(len(dataset), rank=context.rank if context else 0, world_size=context.world_size if context else 1, seed=args.seed + epoch)
@@ -538,6 +590,9 @@ def _run_training(args, context=None):
         group_start = cursor
         group_size = min(args.grad_accum, batches_per_epoch - group_start)
         for batch_index, batch in enumerate(loader, cursor):
+            boundary = (batch_index + 1 - group_start) == group_size
+            if use_deepspeed:
+                model.set_gradient_accumulation_boundary(boundary)
             batch = _move(batch, device)
             with _autocast(device, dtype):
                 loss = model(**batch).loss
@@ -545,41 +600,56 @@ def _run_training(args, context=None):
                 raise RuntimeError(f"Nonfinite training loss at epoch={epoch}, batch={batch_index}")
             group_loss += float(loss.detach().item())
             # The last, possibly incomplete accumulation group has its own denominator.
-            scaler.scale(loss / group_size).backward()
-            boundary = (batch_index + 1 - group_start) == group_size
+            if use_deepspeed:
+                # Average over the ACTUAL group length, including a short last
+                # group. DeepSpeed must not divide by grad_accum a second time.
+                model.backward(loss / group_size, scale_wrt_gas=False)
+                from .deepspeed_backend import engine_step
+
+                updated, grad_norm, scale_before, scale_after = engine_step(model)
+            else:
+                scaler.scale(loss / group_size).backward()
             if not boundary:
                 continue
-            updated, grad_norm, scale_before, scale_after = _optimizer_update(
-                optimizer, scheduler, scaler, trainable, args.max_grad_norm, model=model, context=context,
-            )
-            optimizer.zero_grad(set_to_none=True)
+            if not use_deepspeed:
+                updated, grad_norm, scale_before, scale_after = _optimizer_update(
+                    optimizer, scheduler, scaler, trainable, args.max_grad_norm, model=model, context=context,
+                )
+                optimizer.zero_grad(set_to_none=True)
+            progress = timer.snapshot(epoch * batches_per_epoch + batch_index + 1)
             if updated:
                 global_step += 1
                 consecutive_overflows = 0
             else:
                 consecutive_overflows += 1
-                _rank_zero_print({"event": "optimizer_step_skipped", "reason": "fp16_gradient_overflow", "epoch": epoch + 1, "next_batch": batch_index + 1, "step": global_step, "loss_scale_before": scale_before, "loss_scale_after": scale_after, "consecutive_overflows": consecutive_overflows}, context)
+                _rank_zero_print({"event": "optimizer_step_skipped", "reason": "fp16_gradient_overflow", "epoch": epoch + 1, "next_batch": batch_index + 1, "step": global_step, "loss_scale_before": scale_before, "loss_scale_after": scale_after, "consecutive_overflows": consecutive_overflows, **progress}, context)
                 if consecutive_overflows >= 32:
                     raise RuntimeError("32 consecutive FP16 gradient overflows prevented optimizer updates; use bfloat16/float32 or inspect the numerical instability")
-            if updated and (global_step % args.log_every == 0 or global_step == 1):
+            if updated and (global_step % args.log_every == 0 or global_step == 1 or batch_index + 1 == batches_per_epoch):
                 mean_loss = _mean_across_ranks(group_loss / group_size, context)
-                _rank_zero_print({"event": "train_step", "epoch": epoch + 1, "step": global_step, "loss": mean_loss, "grad_norm": float(grad_norm), "fusion_lr": optimizer.param_groups[0]["lr"], "projector_lr": optimizer.param_groups[1]["lr"]}, context)
+                # Older FSDP checkpoints did not name their parameter groups.
+                rates = {group.get("name", ("fusion", "projector")[i]): group["lr"]
+                         for i, group in enumerate(optimizer.param_groups)}
+                _rank_zero_print({"event": "train_step", "epoch": epoch + 1, "step": global_step, "loss": mean_loss, "grad_norm": float(grad_norm) if grad_norm is not None else None, "fusion_lr": rates.get("fusion"), "projector_lr": rates["projector"], "progress_unit": "batch", "eta_scope": "remaining_training_batches", **progress}, context)
             next_batch = batch_index + 1
             if args.save_every_steps and global_step % args.save_every_steps == 0 and next_batch < batches_per_epoch:
-                _save_checkpoint(model, tokenizer, output / f"checkpoint-step-{global_step}", args, optimizer, scheduler, scaler, signature, epoch=epoch, next_batch=next_batch, global_step=global_step, best_val_loss=best_val_loss, consecutive_overflows=consecutive_overflows, context=context)
+                with timer.paused():
+                    _save_checkpoint(model, tokenizer, output / f"checkpoint-step-{global_step}", args, optimizer, scheduler, scaler, signature, epoch=epoch, next_batch=next_batch, global_step=global_step, best_val_loss=best_val_loss, consecutive_overflows=consecutive_overflows, context=context)
             group_start, group_loss = next_batch, 0.0
             group_size = min(args.grad_accum, batches_per_epoch - group_start)
-        if validation is not None:
-            val_loss = evaluate(model, validation, args, tokenizer.pad_token_id, device, dtype, context)
-            _rank_zero_print({"event": "validation", "epoch": epoch + 1, "step": global_step, "answer_token_loss": val_loss}, context)
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                _save_checkpoint(model, tokenizer, output / "best", args, optimizer, scheduler, scaler, signature, epoch=epoch + 1, next_batch=0, global_step=global_step, best_val_loss=best_val_loss, consecutive_overflows=consecutive_overflows, context=context)
-        _save_checkpoint(model, tokenizer, output / f"checkpoint-epoch-{epoch + 1}", args, optimizer, scheduler, scaler, signature, epoch=epoch + 1, next_batch=0, global_step=global_step, best_val_loss=best_val_loss, consecutive_overflows=consecutive_overflows, context=context)
+        with timer.paused():
+            if validation is not None:
+                val_loss = evaluate(model, validation, args, tokenizer.pad_token_id, device, dtype, context)
+                _rank_zero_print({"event": "validation", "epoch": epoch + 1, "step": global_step, "answer_token_loss": val_loss}, context)
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    _save_checkpoint(model, tokenizer, output / "best", args, optimizer, scheduler, scaler, signature, epoch=epoch + 1, next_batch=0, global_step=global_step, best_val_loss=best_val_loss, consecutive_overflows=consecutive_overflows, context=context)
+            _save_checkpoint(model, tokenizer, output / f"checkpoint-epoch-{epoch + 1}", args, optimizer, scheduler, scaler, signature, epoch=epoch + 1, next_batch=0, global_step=global_step, best_val_loss=best_val_loss, consecutive_overflows=consecutive_overflows, context=context)
     if global_step == 0:
         raise RuntimeError("Training ended without a successful optimizer update; inspect overflow events and select bfloat16/float32")
-    _save_checkpoint(model, tokenizer, output, args, optimizer, scheduler, scaler, signature, epoch=args.epochs, next_batch=0, global_step=global_step, best_val_loss=best_val_loss, consecutive_overflows=consecutive_overflows, context=context)
-    _rank_zero_print({"event": "train_complete", "output": str(output), "steps": global_step}, context)
+    with timer.paused():
+        _save_checkpoint(model, tokenizer, output, args, optimizer, scheduler, scaler, signature, epoch=args.epochs, next_batch=0, global_step=global_step, best_val_loss=best_val_loss, consecutive_overflows=consecutive_overflows, context=context)
+    _rank_zero_print({"event": "train_complete", "output": str(output), "steps": global_step, **timer.snapshot()}, context)
 
 
 if __name__ == "__main__":

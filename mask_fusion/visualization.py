@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from .preprocessing import load_mask, _resize_scores
 
@@ -74,17 +74,69 @@ def _draw_boxes(image, metadata):
     return result
 
 
-def _overview(rows, destination, score_max):
+def prediction_display(result):
+    """Use the evaluator's labels; never infer abnormality from an A/B letter."""
+    display = {key: result.get(key) for key in
+               ("gt", "anomaly_prediction", "prediction", "choice", "answer", "correct")}
+    status = "CORRECT" if result.get("correct") is True else (
+        "INCORRECT" if result.get("correct") is False else "UNSCORED")
+    if "anomaly_prediction" in result:
+        labels = {0: "NORMAL", 1: "ABNORMAL"}
+        truth = labels.get(result.get("gt"), "UNKNOWN")
+        predicted = labels.get(result.get("anomaly_prediction"), "UNPARSED")
+        if predicted == "UNPARSED":
+            status = "UNPARSED"
+        display.update({"ground_truth_text": truth, "model_judgment_text": predicted,
+                        "headline": f"GT: {truth} | Model: {predicted} | {status}"})
+    else:
+        # Ordinary QA choices need not mean normal/abnormal.
+        display["headline"] = f"Reference: {result.get('answer') or 'UNKNOWN'} | {status}"
+    display["status"] = status
+    return display
+
+
+def _banner_font(size):
+    for name in ("NotoSansCJK-Regular.ttc", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                 "C:/Windows/Fonts/msyh.ttc", "DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            pass
+    return ImageFont.load_default(size=size)
+
+
+def _fit_text(draw, text, font, max_width):
+    text = " ".join(str(text).split())
+    if draw.textlength(text, font=font) <= max_width:
+        return text
+    while text and draw.textlength(text + "...", font=font) > max_width:
+        text = text[:-1]
+    return text + "..."
+
+
+def _overview(rows, destination, score_max, decision=None):
     side, gap, label_height = 256, 12, 30
     row_height = side + label_height + gap
-    sheet = Image.new("RGB", (3 * side + 4 * gap, 54 + len(rows) * row_height + 50), "white")
+    banner_height = 80 if decision is not None else 0
+    sheet = Image.new("RGB", (3 * side + 4 * gap, banner_height + 54 + len(rows) * row_height + 50), "white")
     draw = ImageDraw.Draw(sheet)
-    draw.text((gap, 8), "Image / selected crops", fill="black")
-    draw.text((2 * gap + side, 8), "Continuous expert mask", fill="black")
-    draw.text((3 * gap + 2 * side, 8), "Image + mask overlay", fill="black")
-    draw.text((gap, 28), "Input rows follow the actual vision-tower order (base first).", fill="black")
+    if decision is not None:
+        palette = {"CORRECT": ("#e5f5e9", "#146b32"), "INCORRECT": ("#fde8e8", "#aa2020"),
+                   "UNPARSED": ("#fff2d5", "#885700"), "UNSCORED": ("#eeeeee", "#444444")}
+        background, foreground = palette[decision["status"]]
+        draw.rectangle((0, 0, sheet.width, banner_height - 8), fill=background)
+        title_font, response_font = _banner_font(20), _banner_font(14)
+        draw.text((gap, 10), _fit_text(draw, decision["headline"], title_font, sheet.width - 2 * gap),
+                  font=title_font, fill=foreground)
+        response = "Model response: " + (decision.get("prediction") or "(empty)")
+        draw.text((gap, 43), _fit_text(draw, response, response_font, sheet.width - 2 * gap),
+                  font=response_font, fill="black")
+    draw.text((gap, banner_height + 8), "Image / selected crops", fill="black")
+    draw.text((2 * gap + side, banner_height + 8), "Continuous expert mask", fill="black")
+    draw.text((3 * gap + 2 * side, banner_height + 8), "Image + mask overlay", fill="black")
+    draw.text((gap, banner_height + 28), "Input rows follow the actual vision-tower order (base first).", fill="black")
     for row_index, (label, panels) in enumerate(rows):
-        top = 54 + row_index * row_height
+        top = banner_height + 54 + row_index * row_height
         draw.text((gap, top), label, fill="black")
         for column, panel in enumerate(panels):
             preview = ImageOps.contain(panel, (side, side), method=_RESAMPLE.BILINEAR)
@@ -100,12 +152,15 @@ def _overview(rows, destination, score_max):
     sheet.save(destination, quality=92)
 
 
-def save_input_visualization(sample, record, source, processor, output_dir, index, *, score_max=255.0):
+def save_input_visualization(sample, record, source, processor, output_dir, index, *, score_max=255.0,
+                             prediction_result=None):
     """Save original context and exact model views; never rerun preprocessing.
 
     PNG/JPEG files are displays. ``mask_values.npz`` retains the unmodified raw
     continuous score tensors (before fusion score_scale) and padding validity.
     A numeric dataset index prevents collisions from duplicate IDs and paths.
+    Prediction annotations are added only to the overview, after evaluation;
+    the individual input images and score arrays remain unannotated.
     """
     metadata = sample.get("preprocessing_metadata")
     if not metadata or "views" not in metadata:
@@ -152,7 +207,8 @@ def save_input_visualization(sample, record, source, processor, output_dir, inde
             "valid_pixels": int(selected_scores.size),
         })
     np.savez_compressed(folder / "mask_values.npz", masks=masks, mask_valid=valid, source_mask=source_mask)
-    _overview(rows, folder / "overview.jpg", score_max)
+    decision = prediction_display(prediction_result) if prediction_result is not None else None
+    _overview(rows, folder / "overview.jpg", score_max, decision=decision)
     details = {
         "dataset_index": index, "id": record["id"], "category": record.get("category"),
         "image": record["image"], "mask": record["mask"], **source,
@@ -162,6 +218,8 @@ def save_input_visualization(sample, record, source, processor, output_dir, inde
                     "rgb": "inverse processor normalization/rescaling of actual input tensor",
                     "scores": "Only displays are clipped; mask_values.npz preserves input scores."},
     }
+    if decision is not None:
+        details["prediction_result"] = decision
     (folder / "metadata.json").write_text(json.dumps(details, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"directory": str(folder), "overview": str(folder / "overview.jpg"),
             "metadata": str(folder / "metadata.json"), "mask_values": str(folder / "mask_values.npz")}

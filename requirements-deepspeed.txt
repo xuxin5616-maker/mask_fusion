@@ -1,0 +1,3 @@
+# Optional Linux/CUDA backend. Install the project's existing requirements first.
+# Keep the existing PyTorch/Transformers stack; DeepSpeed is not needed by infer.
+deepspeed==0.16.4

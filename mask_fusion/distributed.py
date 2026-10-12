@@ -35,7 +35,7 @@ class DistributedContext:
         return self.rank == 0
 
 
-def initialize_distributed() -> DistributedContext:
+def initialize_distributed(strategy="FSDP") -> DistributedContext:
     """Initialize a CUDA/NCCL process group from torchrun's environment.
 
     This is an explicit multi-GPU entrypoint, not an implicit single-process
@@ -43,15 +43,15 @@ def initialize_distributed() -> DistributedContext:
     """
     required = ("RANK", "WORLD_SIZE", "LOCAL_RANK")
     if any(name not in os.environ for name in required):
-        raise RuntimeError("FSDP requires torchrun with RANK, WORLD_SIZE and LOCAL_RANK")
+        raise RuntimeError(f"{strategy} requires torchrun with RANK, WORLD_SIZE and LOCAL_RANK")
     try:
         rank, world_size, local_rank = (int(os.environ[name]) for name in required)
     except ValueError as error:
         raise ValueError("torchrun rank environment variables must be integers") from error
     if world_size < 2 or not 0 <= rank < world_size or local_rank < 0:
-        raise ValueError("FSDP requires WORLD_SIZE >= 2 and valid torchrun ranks")
+        raise ValueError(f"{strategy} requires WORLD_SIZE >= 2 and valid torchrun ranks")
     if not dist.is_available() or not dist.is_nccl_available():
-        raise RuntimeError("FSDP training requires a PyTorch build with NCCL")
+        raise RuntimeError(f"{strategy} training requires a PyTorch build with NCCL")
     if not torch.cuda.is_available() or local_rank >= torch.cuda.device_count():
         raise RuntimeError(f"No CUDA device for LOCAL_RANK={local_rank}")
     torch.cuda.set_device(local_rank)
