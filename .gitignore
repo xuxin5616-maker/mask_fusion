@@ -6,5 +6,6 @@ outputs/
 checkpoints/
 runs/
 results/
+data/synthetic_masks*/
 .fsdp-smoke-*/
 *.egg-info/

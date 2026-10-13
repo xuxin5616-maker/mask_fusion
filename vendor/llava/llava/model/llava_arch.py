@@ -203,9 +203,25 @@ class LlavaMetaForCausalLM(ABC):
         return image_feature
 
     def encode_images(self, images, masks=None, mask_valid=None):
-        image_features = self.get_model().get_vision_tower()(images)
-        # image_features = self.get_model().vision_resampler(image_features, images=images)
         core = self.get_model()
+        mask_only = bool(getattr(self.config, "mask_fusion_pretrain", False))
+        if mask_only:
+            if not hasattr(core, "mask_fusion") or masks is None:
+                raise ValueError("Mask pretraining requires an attached fusion module and aligned masks")
+            if (not isinstance(masks, torch.Tensor) or masks.ndim != 4 or masks.shape[1] != 1
+                    or not isinstance(images, torch.Tensor) or images.ndim != 4
+                    or masks.shape[0] != images.shape[0] or masks.shape[-2:] != images.shape[-2:]):
+                raise ValueError("Mask pretraining requires [B,1,H,W] masks aligned with image placeholders")
+            parameter = next(core.mask_fusion.parameters())
+            patch_size = core.mask_fusion.mask_encoder.patch_size
+            height, width = masks.shape[-2:]
+            image_features = torch.zeros(
+                masks.shape[0], (height // patch_size) * (width // patch_size),
+                core.mask_fusion.vision_dim, device=parameter.device, dtype=parameter.dtype,
+            )
+        else:
+            image_features = core.get_vision_tower()(images)
+        # image_features = core.vision_resampler(image_features, images=images)
         if hasattr(core, "mask_fusion"):
             if masks is None and core.mask_fusion.config.mode != "none":
                 raise ValueError("An enabled mask-fusion model requires aligned continuous masks")
@@ -214,6 +230,7 @@ class LlavaMetaForCausalLM(ABC):
                 image_features.to(device=parameter.device, dtype=parameter.dtype),
                 None if masks is None else masks.to(parameter.device),
                 None if mask_valid is None else mask_valid.to(parameter.device),
+                mask_only=mask_only,
             )
         elif masks is not None or mask_valid is not None:
             raise ValueError("Expert masks were supplied without an attached mask-fusion module")

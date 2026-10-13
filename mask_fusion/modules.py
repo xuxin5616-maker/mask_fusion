@@ -222,6 +222,8 @@ class ExpertMaskFusion(nn.Module):
         image_features: Tensor,
         masks: Optional[Tensor],
         mask_valid: Optional[Tensor] = None,
+        *,
+        mask_only: bool = False,
     ) -> Tensor:
         if image_features.ndim != 3 or image_features.shape[-1] != self.vision_dim:
             raise ValueError("image_features must have shape [batch, patches, vision_dim]")
@@ -229,7 +231,7 @@ class ExpertMaskFusion(nn.Module):
             raise ValueError("image_features must contain at least one image and patch")
         if not image_features.is_floating_point():
             raise ValueError("image_features must be floating-point features")
-        if self.config.mode == "none":
+        if self.config.mode == "none" and not mask_only:
             direct = image_features.new_zeros(*image_features.shape[:2], self.expert_feature_dim)
             return torch.cat((image_features, direct), dim=-1)
         if masks is None:
@@ -243,6 +245,11 @@ class ExpertMaskFusion(nn.Module):
                 "Mask patch grid must match vision features: "
                 f"mask={tuple(expert.shape[:2])}, vision={tuple(image_features.shape[:2])}"
             )
+        if mask_only:
+            # Runtime phase-1 branch, not a persistent architecture ablation.
+            # Keep the complete fusion forward as the FSDP/ZeRO entrypoint;
+            # calling mask_encoder directly would bypass its parent's hooks.
+            return torch.cat((torch.zeros_like(image_features), expert), dim=-1)
         updated = image_features
         if self.config.mode in ("both", "attention"):
             prior = self.encode_prior(expert, grid_shape, valid_tokens)
@@ -253,6 +260,38 @@ class ExpertMaskFusion(nn.Module):
         if self.config.mode == "attention":
             expert = torch.zeros_like(expert)
         return torch.cat((updated, expert.to(dtype=updated.dtype)), dim=-1)
+
+
+class SplitInputLinear(nn.Module):
+    """A linear projector with physically separate visual and expert weights.
+
+    Phase 1 optimizes only expert_weight. Frozen visual_weight and bias are
+    different Parameters, so AdamW decay/momentum cannot change their columns.
+    Concatenating weights inside forward preserves the ordinary Linear's
+    numerical path, including autocast; exported adapters merge these weights.
+    """
+
+    def __init__(self, linear: nn.Linear, visual_dim: int) -> None:
+        super().__init__()
+        if not isinstance(linear, nn.Linear):
+            raise TypeError("SplitInputLinear requires an nn.Linear")
+        if (isinstance(visual_dim, bool) or not isinstance(visual_dim, int)
+                or not 0 < visual_dim < linear.in_features):
+            raise ValueError("visual_dim must leave nonempty visual and expert columns")
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        self.visual_dim = visual_dim
+        self.visual_weight = nn.Parameter(linear.weight[:, :visual_dim].detach().clone(), requires_grad=False)
+        self.expert_weight = nn.Parameter(linear.weight[:, visual_dim:].detach().clone())
+        if linear.bias is None:
+            self.register_parameter("bias", None)
+        else:
+            self.bias = nn.Parameter(linear.bias.detach().clone(), requires_grad=False)
+        self.train(linear.training)
+
+    def forward(self, features: Tensor) -> Tensor:
+        weight = torch.cat((self.visual_weight, self.expert_weight), dim=1)
+        return F.linear(features, weight, self.bias)
 
 
 def expand_projector(projector: nn.Module, extra_dim: int) -> nn.Module:

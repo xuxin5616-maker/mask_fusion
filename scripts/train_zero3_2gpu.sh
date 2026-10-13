@@ -3,7 +3,8 @@
 # DATA_ROOT 是 JSON 内相对 image/mask 路径的共同前缀，不是 JSON 的目录。
 # 示例：DATA_ROOT=/home/yz/xxy/data/datasets bash scripts/train_zero3_2gpu.sh --data train1.json train2.json
 # 预览：DRY_RUN=1 bash scripts/train_zero3_2gpu.sh --data "train file.jsonl"
-# 默认使用 no_hidden_norm.json；可通过 --fusion-config 覆盖。
+# 默认使用 default.json，启用 H 和 E 的 LayerNorm；可通过 --fusion-config 覆盖。
+# 无 H LayerNorm 的旧实验可显式指定 configs/no_hidden_norm.json 和单独输出目录。
 # FSDP checkpoint 不能恢复 ZeRO 优化器；首次切换请使用新输出目录。
 set -euo pipefail
 
@@ -16,7 +17,7 @@ cd -- "${PROJECT_ROOT}"
 
 BASE_MODEL="${BASE_MODEL:-/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/zero3_2gpu_no_hidden_norm}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/zero3_2gpu_with_norm}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export PYTHONUNBUFFERED=1
@@ -41,7 +42,7 @@ command=(
     --standalone --nproc_per_node=2 --module mask_fusion.train
     --distributed deepspeed
     --deepspeed-config "${DEEPSPEED_CONFIG:-${PROJECT_ROOT}/configs/zero3.json}"
-    --fusion-config "${FUSION_CONFIG:-${PROJECT_ROOT}/configs/no_hidden_norm.json}"
+    --fusion-config "${FUSION_CONFIG:-${PROJECT_ROOT}/configs/default.json}"
     --base-model "${BASE_MODEL}"
     --output "${OUTPUT_DIR}"
     --dtype bfloat16

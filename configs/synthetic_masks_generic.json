@@ -1,0 +1,39 @@
+{
+  "description": "Uncalibrated synthetic score-map curriculum. Normal/abnormal labels follow the synthetic rule below, not real MuSc V2 calibration. Review preview.png and adapt these ranges using real masks before long training.",
+  "abnormal_fraction": 0.5,
+  "score_threshold": 128,
+  "abnormal_min_coverage": 0.006,
+  "patch_size": 14,
+  "abnormal_min_patch_mean": 140.0,
+  "score_bin_edges": [64, 128, 192],
+  "coverage_bin_edges": [0.005, 0.05, 0.2],
+  "elongated_aspect_ratio": 3.0,
+  "max_attempts": 100,
+  "tasks": ["anomaly", "location", "intensity", "coverage", "shape"],
+  "normal": {
+    "background_range": [5, 65],
+    "background_noise_std": [1, 10],
+    "region_count_range": [0, 3],
+    "region_peak_range": [70, 180],
+    "region_area_range": [0.0003, 0.003],
+    "elongation_range": [1, 6],
+    "blur_radius_range": [0.5, 2.5],
+    "shapes": ["ellipse", "rectangle", "streak"],
+    "hotspot_count_range": [0, 3],
+    "hotspot_peak_range": [190, 250],
+    "hotspot_area_range": [0.00003, 0.0003]
+  },
+  "abnormal": {
+    "background_range": [5, 65],
+    "background_noise_std": [1, 10],
+    "region_count_range": [1, 3],
+    "region_peak_range": [165, 250],
+    "region_area_range": [0.012, 0.15],
+    "elongation_range": [1, 6],
+    "blur_radius_range": [0.5, 3.5],
+    "shapes": ["ellipse", "rectangle", "streak"],
+    "hotspot_count_range": [0, 3],
+    "hotspot_peak_range": [190, 250],
+    "hotspot_area_range": [0.00003, 0.0003]
+  }
+}

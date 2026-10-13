@@ -54,6 +54,20 @@ flowchart LR
 
 配置见 `configs/default.json`。128/256 维宽度、1 层、8 个头、`alpha_init=0.01`、H/E LayerNorm 都是可修改的起始设置，不是已验证的最优超参数。`normalize_e=false` 可关闭注意力先验的归一化；直接进入 projector 的均值/最大值不经过 H/E 的 LayerNorm。
 
+2026-10-13 起，`scripts/train_zero3_2gpu.sh` 默认使用 `configs/default.json`，恢复 `normalize_hidden=true`，保留 `normalize_e=true`。两处归一化分别作用于每个 patch 的 128 维 CNN 特征 H，以及拼接后的 512 维 E；不对原始 mask 做逐图 min-max，也不对直接拼接的异常均值/最大值做 LayerNorm。`num_layers=1` 保持不变：新增模块为一层 8 头注意力加视觉残差，没有额外视觉 FFN。
+
+ZeRO-3 脚本的新默认输出为 `outputs/zero3_2gpu_with_norm`。保留 `configs/no_hidden_norm.json` 用于旧消融实验，该配置只关闭 H 的 LayerNorm，E 的 LayerNorm 仍开启。恢复 H 的 LayerNorm 会新增可训练的缩放/偏置参数，因此旧无 H LayerNorm 的 adapter 不能直接修改保存配置或使用原优化器断点恢复为新结构；使用原始 LLaVA 底座开始新的融合模块/projector 训练。例如：
+
+```bash
+bash scripts/train_zero3_2gpu.sh \
+  --dtype float32 \
+  --image-mode randomroi \
+  --fusion-config configs/default.json \
+  --output outputs/zero3_randomroi_fp32_with_norm
+```
+
+上述命令沿用脚本中已配置的数据列表；若未配置，仍需传入 `--data`。测试时将 `ADAPTER` 指向这一新输出目录，推理会恢复保存的归一化开关和层数。
+
 ### 初始化与消融
 
 projector 第一层复制旧视觉列、偏置和所有后续层，新增 130 列初始化为零。注意力使用正常初始化、alpha 从小非零值开始，因此完整模型初始输出不保证与 baseline 严格相同。
@@ -415,6 +429,107 @@ ANOMALY_PROMPT=category-mcq bash scripts/test_mvtec.sh
 这些描述是待验证的类别检测规则，不能替代正常视觉参考。例如 metal_nut/flip 说明了翻面属于异常，
 但没有编造正确朝向面的具体凹槽特征；cable_swap、pill_type 和 misplaced 也依赖预期产品结构或摆放标准。
 比较提示词时使用同一 checkpoint、相同数据顺序、seed、mask 和图像模式，同时检查异常召回及正常误报。
+
+## 合成 mask 预训练，再接真实数据 SFT
+
+新增入口 `python -m mask_fusion.pretrain`。第一阶段跳过 vision tower，在其输出位置构造零视觉特征，绕过注意力，只走 `[0; H; mean; max] → projector → 冻结 Qwen`。只更新 mask CNN、H 的 LayerNorm 和 projector 第一层新增的 mask 输入权重；原视觉输入权重、原 bias、projector 后续层、E 映射及注意力均冻结。首层视觉权重与 mask 权重物理拆分，AdamW 的 weight decay 也不会改动冻结部分。冻结 Qwen 仍保留反向传播到输入的计算图。
+
+预训练保存时把首层重新合并为标准 Linear，导出的 `adapter.safetensors` 可直接用于第二阶段的权重初始化。第一阶段新增 mask 列初始为零时，第一次更新主要发生在这些列；列更新后，后续步骤才会给 mask CNN 提供直接通路的梯度。
+
+### 一键执行生成、双卡预训练、真实数据 SFT 和测试
+
+修改 [scripts/run_mask_pretrain_pipeline.sh](scripts/run_mask_pretrain_pipeline.sh) 开头的配置区，然后在原来的训练环境运行：
+
+```bash
+# 仅打印四个阶段的完整命令，不生成数据、不创建日志、不加载模型
+DRY_RUN=1 bash scripts/run_mask_pretrain_pipeline.sh
+
+# 顺序执行全部阶段；任一步失败即停止，日志自动保存
+bash scripts/run_mask_pretrain_pipeline.sh
+
+# 同一实验的前两步已完成时，从真实数据训练开始（不是阶段内断点续训）
+START_STAGE=3 bash scripts/run_mask_pretrain_pipeline.sh
+
+# 新实验修改名称，各阶段默认输出路径会一起改变
+RUN_NAME=mask_reference_v2 bash scripts/run_mask_pretrain_pipeline.sh
+```
+
+默认生成 2,000/200 张训练/验证 mask；预训练和 SFT 均用 GPU `0,1`、FP32、3 epochs、单卡 batch 1、累积 4 步，测试使用 GPU `0`、FP32、类别 A/B 提示词并保存全部可视化。预训练固定 `square`；SFT 默认为 `randomroi`；测试从 SFT adapter 读取图像模式。SFT 通过 `--init-adapter` 接入预训练最终权重，继续训练整个 fusion 和 projector，vision tower/Qwen 保持冻结。
+
+顶部可修改两份 `TRAIN_FILES`、可选 `VAL_FILES`、三个阶段各自的数据根目录、模型路径、GPU、学习率、epochs、生成数量和输出目录。数组路径用空格或换行分隔，不加逗号。`TRAIN_DATA_ROOT` 沿用此前 `/home/yz/xxy/data`，`TEST_DATA_ROOT` 为 `/home/yz/xxy/data/datasets`；请对应 JSON 内部的相对路径修改。合成数据的两个 root 均自动绑定到生成目录。相对路径统一以项目目录为基准。
+
+默认 `RUN_NAME=mask_reference_v1` 的输出为：
+
+- 合成数据：`data/synthetic_masks_mask_reference_v1/`。
+- 预训练权重：`outputs/mask_reference_v1/pretrain/`；SFT 权重：`outputs/mask_reference_v1/sft/`。
+- 阶段日志：`outputs/mask_reference_v1/logs/{1_generate,2_pretrain,3_sft,4_test}.log`。
+- 测试结果：`results/mvtec_mask_reference_v1.jsonl` 和 `results/mvtec_mask_reference_v1.metrics.json`。
+- 全量可视化：`results/mvtec_mask_reference_v1_vis/`。
+
+已有数据/训练输出/测试结果不会自动覆盖或跳过；重复全流程使用新的 `RUN_NAME`。`START_STAGE` / `END_STAGE` 取 1–4，例如 `END_STAGE=1` 只生成数据，`START_STAGE=4` 只测试已完成的 SFT。阶段中途失败需要恢复优化器时，使用原单阶段脚本的 `--resume`，不要把 `START_STAGE` 当作断点恢复。
+
+### 生成并检查样本
+
+```bash
+python -m mask_fusion.synthetic_masks \
+  --output data/synthetic_masks \
+  --config configs/synthetic_masks.json \
+  --train-count 2000 --val-count 200 \
+  --size 384 --seed 0 --preview-count 16
+```
+
+`train-count` / `val-count` 是独立 mask 数；默认每张 5 条选择题，包括 normal/abnormal、位置、分数强度、覆盖比例和形状。这里的数量只是可运行示例，不代表验证过的数据需求。同一张 mask 的所有问答放在同一划分，训练/验证的可见像素内容去重，选项顺序会变化，正确答案字母按题型均衡。
+
+输出包含：
+
+- `masks/train/`、`masks/val/`：0–255 单通道原始分数 PNG，不二值化，不做逐图 min-max。
+- `train.jsonl`、`val.jsonl`：直接供预训练使用的 QA。
+- `train_masks.jsonl`、`val_masks.jsonl`：逐 mask 的统计、标签及像素 hash。
+- `preview.png`：训练/验证两类样本预览，使用固定 0–255 灰度显示。
+- `generator_config.json`、`summary.json`：实际生成规则、各题型的答案文字及字母分布。
+
+**先查看 `preview.png` 再正式训练。默认 normal/abnormal 是合成规则标签，不是真实缺陷标注，也不是 MuSc V2 的推理阈值。** 2026-10-13 已根据 `outputs/nor` 和 `outputs/abn` 各 5 张参考调整 `configs/synthetic_masks.json`：正常图为低灰度背景与暗灰结构，异常图加入中灰到亮灰区域；取消正常图中的高亮白色噪点，两类共用形状、面积及模糊范围。参考文件是 RGB 截图，排除四边各 3% 后按显示灰度近似匹配，没有把这些数值当作原始专家概率校准。
+
+新配置使用 `label_rule="blurred_peak"`：只在可见区域上做半径 3 的高斯平滑，平滑峰值达到 80 即作为合成 abnormal；不再要求亮区达到固定面积，也不要求 patch 均分达到 140。这样低于 128 的中灰异常和较小连续亮块不会被旧条件直接排除，孤立的单像素尖峰则会被平滑削弱。极小异常仍可能被平滑稀释；这个规则只用于生成阶段的可复算标签。平滑仅计算标签，保存和训练输入仍是未做这一步平滑的连续分数 PNG。`score_threshold=64` 用于覆盖比例与形状题，和异常判别的平滑峰值阈值是两项不同设置。
+
+旧配置保留为 `configs/synthetic_masks_generic.json`，可用 `--config` 显式选择。CLI 不传 `--config` 时读取新的项目配置；Python API 的 `load_config()` / `generate_dataset(..., config=None)` 保留旧规则，调用 API 使用新风格时请显式传入 `load_config("configs/synthetic_masks.json")`。详细数值和局限见 [参考 mask 与生成配置](docs/synthetic_mask_reference.md)。
+
+答案字母均衡不等于答案语义均衡，尤其形状问题可能集中为 compact；查看 `summary.json` 的 `answer_text_counts` 后调整生成配置。生成器拒绝覆盖非空目录，修改分布后请使用新的输出目录。
+
+若之前已经生成过旧版 `data/synthetic_masks`，可改用 `--output data/synthetic_masks_reference`，训练时设置 `SYNTHETIC_DATA_DIR=data/synthetic_masks_reference`；已有 PNG/QA 不会因为修改配置而自动更新。
+
+该 SigLIP 的 patch 为 14×14，384×384 输入实际编码左上 378×378；所有合成答案从保存后的 PNG 可见区域重新计算，避免不可见边缘决定标签。第一阶段只允许 `square`，且训练前检查 mask 和占位图必须匹配 tower 的原尺寸，防止缩放/ROI 改变答案。JSON 的 `image` 字段复用 mask PNG 作为数据接口占位；它不会进入 vision tower，**这些 JSON 不要作为普通真实图像 SFT 数据使用**。
+
+### 双卡预训练
+
+```bash
+# 先查看实际将执行的命令，不启动训练
+DRY_RUN=1 bash scripts/pretrain_mask_zero3_2gpu.sh
+
+# 默认使用物理 GPU 0、1，ZeRO-3，BF16；沿用 FP32 实验可显式覆盖
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/pretrain_mask_zero3_2gpu.sh --dtype float32
+```
+
+默认读取 `data/synthetic_masks/train.jsonl` 和 `val.jsonl`，输出到 `outputs/mask_pretrain_zero3`。支持 `SYNTHETIC_DATA_DIR`、`BASE_MODEL`、`OUTPUT_DIR`、`DATA_ROOT` 等环境变量，以及 `--data train1.jsonl train2.jsonl` / `--val-data val.jsonl` 多文件参数。相对图片路径默认相对于各 JSON；给合成数据沿用真实数据的 `DATA_ROOT` 会改变解析位置，通常无需设置。修改生成目录可用 `SYNTHETIC_DATA_DIR=新目录`。
+
+沿用已有 DeepSpeed 依赖和 ZeRO-3 配置。预训练阶段冻结大模型仍需要通过 Qwen 做前向和输入梯度反传，因此并非只训练小 CNN 的计算成本。验证集会记录答案 token loss，并按最低验证 loss 保存 `best/`；合成验证 loss 不能代表真实缺陷准确率。
+
+### 用原来的真实数据开始第二阶段
+
+```bash
+DATA_ROOT=/home/yz/xxy/data/datasets \
+bash scripts/train_zero3_2gpu.sh \
+  --init-adapter outputs/mask_pretrain_zero3 \
+  --data /absolute/path/train_a.json /absolute/path/train_b.json \
+  --dtype float32 --image-mode randomroi \
+  --output outputs/zero3_after_mask_pretrain
+```
+
+将 `--data` 和 `DATA_ROOT` 换成原来真实训练使用的值；原脚本已填写 `TRAIN_FILES` 时可以省略 `--data`。`--init-adapter` 仅加载权重，重新初始化优化器、调度器和训练步数，显式允许从预训练 `square` 切换到真实训练的 `randomroi` / `anyres_max_9`。恢复真实图像、注意力和正常训练配置：训练整个 fusion 与整个 projector，继续冻结专家模型、vision tower 和 Qwen。两个阶段应使用相同的原 LLaVA checkpoint 和兼容的 fusion 配置。
+
+`--resume` 只用于同一阶段断点续训，不能和 `--init-adapter` 同时使用；直接把预训练 checkpoint 当作 SFT `--resume` 会报错。第二阶段再次续训只传自己的 `--resume`，无需再次提供预训练目录。第一阶段导出的是初始化权重，还不能据此宣称真实图像融合已经训练好。
+
+2026-10-13：全项目 210 项 CPU 测试通过。本地验证使用随机初始化的 tiny Qwen，覆盖冻结参数、梯度、RGB 无影响、标准 adapter 导出、第一阶段断点恢复和第二阶段从新步数开始训练；没有运行真实 7B / 双 A100 的预训练，也没有验证模型收益。
 
 ## 验证与当前边界
 

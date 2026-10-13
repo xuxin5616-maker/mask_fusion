@@ -24,6 +24,8 @@ def parse_args(argv=None):
     parser.add_argument("--base-model", required=True, help="Local LLaVA-OneVision Qwen2 checkpoint")
     parser.add_argument("--data", required=True, nargs="+", action="extend", metavar="FILE", help="One or more training JSONL/JSON files; may repeat --data")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--training-stage", choices=("sft", "mask_pretrain"), default="sft",
+                        help="mask_pretrain uses zero visual features and trains only the mask encoder and new projector columns")
     parser.add_argument("--fusion-config", help="Optional fusion configuration JSON")
     parser.add_argument("--vision-tower", help="Optional local SigLIP directory overriding the checkpoint's vision tower path")
     parser.add_argument("--image-mode", default="anyres_max_9")
@@ -50,6 +52,7 @@ def parse_args(argv=None):
     parser.add_argument("--log-every", type=int, default=10, help="Optimizer steps between loss reports")
     parser.add_argument("--save-every-steps", type=int, default=0, help="Also save resumable checkpoints at this interval; 0 = epoch only")
     parser.add_argument("--resume", help="Explicit checkpoint directory containing adapter and training_state.pt")
+    parser.add_argument("--init-adapter", help="Initialize a NEW run from adapter weights only; permits a new image mode, resets optimizer/scheduler, and cannot be combined with --resume")
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
     args = parser.parse_args(argv)
     for name in ("epochs", "batch_size", "grad_accum", "max_text_length", "log_every"):
@@ -65,6 +68,10 @@ def parse_args(argv=None):
         parser.error("--require-disjoint-categories requires --val-data")
     if args.deepspeed_config and args.distributed != "deepspeed":
         parser.error("--deepspeed-config requires --distributed deepspeed")
+    if args.resume and args.init_adapter:
+        parser.error("--init-adapter starts a new run; use either --init-adapter or --resume")
+    if args.training_stage == "mask_pretrain" and args.image_mode != "square":
+        parser.error("mask_pretrain requires --image-mode square so whole-mask QA labels stay valid")
     # Preserve the existing single-file argument/metadata representation.
     # Multi-file order is meaningful for deterministic shuffle and resume.
     for name in ("data", "val_data"):
@@ -127,6 +134,7 @@ def _fingerprint(path):
 
 def _run_signature(args, dataset_size: int, total_steps: int, dtype_name: str, context=None):
     return {
+        "training_stage": getattr(args, "training_stage", "sft"),
         "base_model": str(Path(args.base_model).resolve()),
         "train_data": _fingerprint(args.data), "val_data": _fingerprint(args.val_data),
         "data_root": str(Path(args.data_root).resolve()) if args.data_root else None,
@@ -143,6 +151,42 @@ def _run_signature(args, dataset_size: int, total_steps: int, dtype_name: str, c
         "gradient_checkpointing": not args.no_gradient_checkpointing,
         "distributed": args.distributed, "world_size": context.world_size if context else 1,
     }
+
+
+def _initial_adapter_signature(path):
+    """Record the exact initialization without loading optimizer state."""
+    folder = Path(path).expanduser().resolve()
+    result = {"path": str(folder)}
+    for name in ("adapter_config.json", "adapter.safetensors"):
+        digest = hashlib.sha256()
+        with (folder / name).open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        result[name] = digest.hexdigest()
+    return result
+
+
+def _validate_pretrain_sizes(dataset, model):
+    """Reject label-changing resizes of maps whose QA was computed offline."""
+    from PIL import Image
+    from .preprocessing import load_mask
+
+    side = int(model.get_vision_tower().config.image_size)
+    seen = set()
+    for record in dataset.records:
+        pair = (record["image"], record["mask"])
+        if pair in seen:
+            continue
+        seen.add(pair)
+        with Image.open(record["image"]) as source:
+            image_size = source.size
+        mask_shape = load_mask(record["mask"]).shape
+        if image_size != (side, side) or mask_shape != (side, side):
+            raise ValueError(
+                f"mask_pretrain requires {side}x{side} image placeholders and masks without resizing; "
+                f"got image={image_size}, mask={mask_shape} for {record['mask']}. "
+                f"Regenerate masks and their QA with --size {side}."
+            )
 
 
 def _rng_state(context=None):
@@ -428,6 +472,23 @@ def _run_training(args, context=None):
         resume_state, resume_optimizer = load_resume_metadata(args.resume, context), None
     else:
         resume_state, resume_optimizer = _load_resume_state(Path(args.resume) / "training_state.pt", context) if args.resume else (None, None)
+    if resume_state is not None:
+        saved_stage = resume_state["signature"].get("training_stage", "sft")
+        if saved_stage != args.training_stage:
+            raise ValueError(
+                f"Cannot --resume {saved_stage} as {args.training_stage}; "
+                "use --init-adapter to start the next stage with a fresh optimizer."
+            )
+    initialization = None
+    if args.init_adapter:
+        from .model import read_adapter_config
+
+        initialization = _initial_adapter_signature(args.init_adapter)
+        if fusion_config is None:
+            fusion_config = read_adapter_config(args.init_adapter)["fusion_config"]
+    elif resume_state is not None:
+        # Resuming never needs to reread the adapter that initialized this run.
+        initialization = resume_state["signature"].get("initial_adapter")
     _rank_zero_print({"event": "model_loading", "distributed": args.distributed,
                      "load_device": "cpu" if context else str(device),
                      "message": "Each rank reads the base checkpoint; GPU parameter sharding follows loading." if context else "Loading base checkpoint."}, context)
@@ -438,7 +499,18 @@ def _run_training(args, context=None):
         attn_implementation=args.attn_implementation, vision_tower=args.vision_tower,
         **deferred,
     )
-    configure_trainable(model)
+    if args.init_adapter:
+        from .model import load_adapter
+
+        load_adapter(model, args.init_adapter, allow_image_mode_change=True)
+        _rank_zero_print({"event": "adapter_initialization", "source": initialization,
+                         "message": "Loaded weights only; optimizer, scheduler and step count start fresh."}, context)
+    if args.training_stage == "mask_pretrain":
+        from .model import configure_mask_pretraining
+
+        configure_mask_pretraining(model)
+    else:
+        configure_trainable(model)
     model.config.use_cache = False
     if not args.no_gradient_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -467,6 +539,14 @@ def _run_training(args, context=None):
             if overlap:
                 raise ValueError(f"Training/validation categories overlap: {', '.join(sorted(overlap))}")
 
+    if args.training_stage == "mask_pretrain":
+        _validate_pretrain_sizes(dataset, model)
+        if validation is not None:
+            _validate_pretrain_sizes(validation, model)
+            overlapping_masks = {r["mask"] for r in dataset.records} & {r["mask"] for r in validation.records}
+            if overlapping_masks:
+                raise ValueError(f"Training/validation leakage: {len(overlapping_masks)} identical mask paths appear in both splits")
+
     # Save the original global count before parameters become local FSDP shards.
     trainable_parameter_count = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     original_model = model
@@ -489,7 +569,7 @@ def _run_training(args, context=None):
         if parameter.dtype != torch.float32:
             raise RuntimeError(f"Trainable parameter {name} must remain float32; mixed precision belongs in autocast")
     if not groups["projector"]:
-        raise RuntimeError("The entire pretrained projector must be trainable")
+        raise RuntimeError("No trainable projector parameters for the selected training stage")
     trainable = groups["fusion"] + groups["projector"]
     parameter_groups = [{"params": groups["fusion"], "lr": args.lr, "name": "fusion"},
                         {"params": groups["projector"], "lr": args.projector_lr, "name": "projector"}]
@@ -523,6 +603,7 @@ def _run_training(args, context=None):
     else:
         scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda" and dtype == torch.float16)
     signature = _run_signature(args, len(dataset), total_steps, dtype_name, context)
+    signature["initial_adapter"] = initialization
     if use_deepspeed:
         signature["deepspeed_config"] = ds_config
     start_epoch, start_batch, global_step = 0, 0, 0
@@ -534,6 +615,8 @@ def _run_training(args, context=None):
         saved_signature = dict(resume_state["signature"])
         saved_signature.setdefault("distributed", "none")
         saved_signature.setdefault("world_size", 1)
+        saved_signature.setdefault("training_stage", "sft")
+        saved_signature.setdefault("initial_adapter", None)
         if saved_signature != signature:
             differences = [key for key in signature if signature[key] != saved_signature.get(key)]
             raise ValueError(f"Resume settings/data differ from checkpoint: {', '.join(differences)}")
@@ -574,7 +657,7 @@ def _run_training(args, context=None):
             (output / "deepspeed_config.json").write_text(json.dumps(ds_config, indent=2), encoding="utf-8")
 
     _rank_zero_action(write_args, context)
-    _rank_zero_print({"event": "train_start", "qa_records": len(dataset), "unique_images": len({r['image'] for r in dataset.records}), "trainable_parameters": trainable_parameter_count, "total_steps": total_steps, "resume_step": global_step, "dtype": dtype_name, "distributed": args.distributed, "world_size": context.world_size if context else 1, "effective_batch_size": args.batch_size * args.grad_accum * (context.world_size if context else 1), "repeated_samples_per_epoch": samples_per_rank * (context.world_size if context else 1) - len(dataset)}, context)
+    _rank_zero_print({"event": "train_start", "training_stage": args.training_stage, "qa_records": len(dataset), "unique_images": len({r['image'] for r in dataset.records}), "trainable_parameters": trainable_parameter_count, "total_steps": total_steps, "resume_step": global_step, "dtype": dtype_name, "distributed": args.distributed, "world_size": context.world_size if context else 1, "effective_batch_size": args.batch_size * args.grad_accum * (context.world_size if context else 1), "repeated_samples_per_epoch": samples_per_rank * (context.world_size if context else 1) - len(dataset)}, context)
     if not use_deepspeed:
         optimizer.zero_grad(set_to_none=True)
     timer = ProgressTimer(args.epochs * batches_per_epoch,

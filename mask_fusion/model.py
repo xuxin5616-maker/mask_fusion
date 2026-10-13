@@ -13,7 +13,7 @@ import torch
 
 from .config import FusionConfig
 from .loader import activate_vendor
-from .modules import ExpertMaskFusion, expand_projector
+from .modules import ExpertMaskFusion, SplitInputLinear, expand_projector
 
 
 ADAPTER_VERSION = 1
@@ -68,6 +68,7 @@ def configure_trainable(model):
     """Freeze the backbone, retaining autograd THROUGH the frozen decoder."""
     model.requires_grad_(False)
     core = model.get_model()
+    model.config.mask_fusion_pretrain = False
     core.mm_projector.requires_grad_(True)
     core.mm_projector.float()
     core.mask_fusion.requires_grad_(True)
@@ -84,6 +85,70 @@ def configure_trainable(model):
     model.config.use_cache = False
     return {"trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
             "total": sum(p.numel() for p in model.parameters())}
+
+
+def configure_mask_pretraining(model):
+    """Configure phase 1 before creating an optimizer or a distributed wrapper.
+
+    Load any ordinary adapter first. Only the mask CNN/LN and the projector's
+    expert input columns are trainable. Qwen still propagates input gradients;
+    the vision tower and the prior-attention branch are skipped at runtime.
+    The architecture config stays in mode='both' for phase-2 adapter loading.
+    """
+    core = model.get_model()
+    if not hasattr(core, "mask_fusion"):
+        raise ValueError("Attach mask fusion before configuring mask pretraining")
+    if core.mask_fusion.config.mode != "both":
+        raise ValueError("Mask pretraining requires fusion mode='both' for phase-2 compatibility")
+    projector = core.mm_projector
+    if isinstance(projector, (torch.nn.Linear, SplitInputLinear)):
+        first = projector
+    elif (isinstance(projector, torch.nn.Sequential) and len(projector)
+          and isinstance(projector[0], (torch.nn.Linear, SplitInputLinear))):
+        first = projector[0]
+    else:
+        raise TypeError("Mask pretraining requires a Linear or Sequential-first-Linear projector")
+    visual_dim = core.mask_fusion.vision_dim
+    if first.in_features != visual_dim + core.mask_fusion.expert_feature_dim:
+        raise ValueError("Projector input dimensions do not match fusion visual/expert features")
+    if isinstance(first, SplitInputLinear) and first.visual_dim != visual_dim:
+        raise ValueError("Split projector has the wrong visual column boundary")
+    if not isinstance(first, SplitInputLinear):
+        first = SplitInputLinear(first, visual_dim)
+        if projector is core.mm_projector and not isinstance(projector, torch.nn.Sequential):
+            core.mm_projector = first
+        else:
+            projector[0] = first
+
+    model.requires_grad_(False)
+    # Do not retain stale gradients if the caller previously inspected a normal
+    # training step. The optimizer must be rebuilt for this parameter partition.
+    model.zero_grad(set_to_none=True)
+    core.mask_fusion.float()
+    core.mm_projector.float()
+    core.mask_fusion.mask_encoder.requires_grad_(True)
+    first.expert_weight.requires_grad_(True)
+    model.config.mask_fusion_pretrain = True
+    model.config.use_cache = False
+    model.get_vision_tower().eval()
+    return {"trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
+            "total": sum(p.numel() for p in model.parameters())}
+
+
+def _standard_adapter_weights(weights):
+    """Convert local or collectively gathered split projector weights to v1."""
+    weights = dict(weights)
+    for prefix in ("mm_projector.", "mm_projector.0."):
+        visual_key, expert_key = prefix + "visual_weight", prefix + "expert_weight"
+        if visual_key not in weights and expert_key not in weights:
+            continue
+        if visual_key not in weights or expert_key not in weights or prefix + "weight" in weights:
+            raise ValueError("Incomplete or ambiguous split projector adapter weights")
+        visual, expert = weights.pop(visual_key), weights.pop(expert_key)
+        if visual.ndim != 2 or expert.ndim != 2 or visual.shape[0] != expert.shape[0]:
+            raise ValueError("Gather full split projector matrices before adapter export")
+        weights[prefix + "weight"] = torch.cat((visual, expert), dim=1).contiguous()
+    return weights
 
 
 def read_adapter_config(path):
@@ -207,6 +272,7 @@ def save_adapter(model, output, base_model, tokenizer=None, *, weights=None):
         if not weights or any(not key.startswith(("mask_fusion.", "mm_projector.")) for key in weights):
             raise ValueError("Gathered adapter weights must contain only fusion/projector state")
         weights = {key: value.detach().cpu().contiguous().clone() for key, value in weights.items()}
+    weights = _standard_adapter_weights(weights)
     temporary = folder / "adapter.safetensors.tmp"
     save_file(weights, str(temporary))
     os.replace(temporary, folder / "adapter.safetensors")
@@ -221,6 +287,8 @@ def save_adapter(model, output, base_model, tokenizer=None, *, weights=None):
         "mm_patch_merge_type": model.config.mm_patch_merge_type,
         "base_model_type": model.config.model_type,
     }
+    if getattr(model.config, "mask_fusion_pretrain", False):
+        metadata["training_stage"] = "mask_pretrain"
     config_tmp = folder / "adapter_config.json.tmp"
     config_tmp.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
     os.replace(config_tmp, folder / "adapter_config.json")
@@ -228,7 +296,13 @@ def save_adapter(model, output, base_model, tokenizer=None, *, weights=None):
         tokenizer.save_pretrained(str(folder / "tokenizer"))
 
 
-def load_adapter(model, path):
+def load_adapter(model, path, *, allow_image_mode_change=False):
+    """Load the standard adapter, optionally transferring it to new image packing.
+
+    Phase-2 initialization may explicitly change square pretraining to another
+    packing mode. Fusion architecture, dimensions, and exact weight keys must
+    still match. Resume callers retain the default strict packing check.
+    """
     from safetensors.torch import load_file
 
     folder = Path(path)
@@ -238,6 +312,8 @@ def load_adapter(model, path):
                         ("patch_size", model.config.mask_fusion_patch_size),
                         ("hidden_size", model.config.hidden_size),
                         ("mm_patch_merge_type", model.config.mm_patch_merge_type)):
+        if key == "mm_patch_merge_type" and allow_image_mode_change:
+            continue
         if metadata[key] != actual:
             raise ValueError(f"Adapter/model mismatch for {key}: {metadata[key]!r} vs {actual!r}")
     weights = load_file(str(folder / "adapter.safetensors"), device="cpu")

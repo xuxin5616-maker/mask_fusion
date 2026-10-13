@@ -1,0 +1,152 @@
+"""Exercise orchestration with a fake Python executable; no models or GPUs."""
+
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import tempfile
+import unittest
+
+import test_training_script as helpers
+
+
+SCRIPT = helpers.PROJECT / "scripts" / "run_mask_pretrain_pipeline.sh"
+
+
+class PipelineScriptTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.bash = helpers.find_bash()
+        if cls.bash is None:
+            raise unittest.SkipTest("GNU Bash unavailable")
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "project with spaces"
+        (self.root / "scripts").mkdir(parents=True)
+        self.script = self.root / "scripts" / SCRIPT.name
+        source, count = re.subn(r'TRAIN_FILES=\(\n.*?\n\)',
+                               'TRAIN_FILES=("train one.json" "train two.jsonl")',
+                               SCRIPT.read_text(encoding="utf-8"), count=1, flags=re.S)
+        self.assertEqual(count, 1)
+        self.script.write_text(source, encoding="utf-8", newline="\n")
+        self.env = os.environ.copy()
+        # Isolate the launcher configuration from variables on the test host.
+        for name in re.findall(r'^([A-Z_]+)=', source, re.M):
+            self.env.pop(name, None)
+        self.env.update({"DRY_RUN": "1", "PYTHON_BIN": "/missing python with spaces",
+                         "DATA_ROOT": "/unrelated inherited root", "CUDA_VISIBLE_DEVICES": "6,7"})
+
+    def run_script(self, **env):
+        return subprocess.run(
+            [self.bash, "--noprofile", "--norc", self.script.as_posix()],
+            cwd=self.temp.name, env={**self.env, **env}, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=20,
+        )
+
+    def prepare_fake_python(self):
+        for filename in ("train one.json", "train two.jsonl", "test data.jsonl",
+                         "fusion.json", "zero3.json", "synthetic.json"):
+            (self.root / filename).write_text("{}", encoding="utf-8")
+        (self.root / "base model").mkdir()
+        (self.root / "calls").mkdir()
+        fake = self.root / "fake python.sh"
+        fake.write_text('''#!/usr/bin/env bash
+set -eu
+case " $* " in
+    *" mask_fusion.synthetic_masks "*) stage=1 ;;
+    *" mask_fusion.pretrain "*) stage=2 ;;
+    *" mask_fusion.train "*) stage=3 ;;
+    *" mask_fusion.infer "*) stage=4 ;;
+    *) exit 98 ;;
+esac
+printf '%s\\0' "${CUDA_VISIBLE_DEVICES:-}" "$PWD" "$@" > "calls/${stage}.args"
+printf '%s\\n' "$stage" >> calls/order.txt
+printf 'fake stage %s\\n' "$stage"
+if [[ "${FAIL_STAGE:-}" == "$stage" ]]; then exit 23; fi
+''', encoding="utf-8", newline="\n")
+        fake.chmod(0o755)
+        self.env.update({"DRY_RUN": "0", "PYTHON_BIN": "./fake python.sh",
+                         "BASE_MODEL": "base model", "TEST_DATA": "test data.jsonl",
+                         "SYNTHETIC_CONFIG": "synthetic.json", "FUSION_CONFIG": "fusion.json",
+                         "DEEPSPEED_CONFIG": "zero3.json"})
+
+    def command(self, stage):
+        return (self.root / "calls" / f"{stage}.args").read_bytes().decode().split("\0")[:-1]
+
+    @staticmethod
+    def argument(command, option):
+        return command[command.index(option) + 1]
+
+    def test_dry_run_with_spaces_has_no_side_effects_and_links_stages(self):
+        before = sorted(p.relative_to(self.root) for p in self.root.rglob("*"))
+        result = self.run_script(RUN_NAME="experiment one", TRAIN_GPUS="2,3", TEST_GPU="3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(before, sorted(p.relative_to(self.root) for p in self.root.rglob("*")))
+        commands = [shlex.split(line) for line in result.stdout.splitlines()
+                    if " -m " in line]
+        self.assertEqual(len(commands), 4, result.stdout)
+        generated, pretrain, sft, test = commands
+        self.assertEqual(self.argument(pretrain, "--data-root"), self.argument(generated, "--output"))
+        self.assertEqual(self.argument(pretrain, "--val-data-root"), self.argument(generated, "--output"))
+        self.assertEqual(self.argument(sft, "--init-adapter"), self.argument(pretrain, "--output"))
+        self.assertEqual(self.argument(test, "--adapter"), self.argument(sft, "--output"))
+        self.assertIn("CUDA_VISIBLE_DEVICES=2,3", pretrain)
+        self.assertIn("CUDA_VISIBLE_DEVICES=3", test)
+        self.assertNotIn("--image-mode", test)
+        self.assertNotIn("--resume", sft)
+
+    def test_actual_sequence_preserves_roots_gpu_arguments_and_logs(self):
+        self.prepare_fake_python()
+        result = self.run_script(TRAIN_GPUS="2,3", TEST_GPU="3",
+                                 TRAIN_DATA_ROOT="real train root", TEST_DATA_ROOT="real test root")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "calls/order.txt").read_text().splitlines(), ["1", "2", "3", "4"])
+        pretrain, sft, test = [self.command(i) for i in (2, 3, 4)]
+        self.assertEqual([pretrain[0], sft[0], test[0]], ["2,3", "2,3", "3"])
+        self.assertEqual(self.argument(sft, "--data-root"), "real train root")
+        self.assertEqual(self.argument(test, "--data-root"), "real test root")
+        start = sft.index("--data")
+        self.assertEqual(sft[start + 1:start + 3], ["train one.json", "train two.jsonl"])
+        self.assertEqual(self.argument(test, "--visualization-limit"), "0")
+        self.assertEqual(self.argument(test, "--anomaly-prompt"), "category-mcq")
+        logs = self.root / "outputs/mask_reference_v1/logs"
+        self.assertEqual(len(list(logs.glob("*.log"))), 4)
+        self.assertIn("fake stage 2", (logs / "2_pretrain.log").read_text())
+
+    def test_training_failure_stops_before_sft_and_test_and_preserves_exit_code(self):
+        self.prepare_fake_python()
+        result = self.run_script(FAIL_STAGE="2")
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertEqual((self.root / "calls/order.txt").read_text().splitlines(), ["1", "2"])
+        self.assertIn("2_pretrain failed", result.stderr)
+        self.assertFalse((self.root / "calls/3.args").exists())
+
+    def test_stage_selection_and_visualization_disable(self):
+        self.prepare_fake_python()
+        result = self.run_script(START_STAGE="3", END_STAGE="4", VISUALIZE="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "calls/order.txt").read_text().splitlines(), ["3", "4"])
+        self.assertNotIn("--visualization-dir", self.command(4))
+        self.assertNotIn("--visualize", self.command(4))
+
+    def test_invalid_ranges_and_gpu_selection_fail_before_writing(self):
+        for env in ({"START_STAGE": "0"}, {"END_STAGE": "5"}, {"START_STAGE": "word"},
+                    {"START_STAGE": "4", "END_STAGE": "2"}, {"TRAIN_GPUS": "0"},
+                    {"TRAIN_GPUS": "0,0"}, {"TEST_GPU": "0,1"}):
+            with self.subTest(env=env):
+                result = self.run_script(**env)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertNotIn("[1/4]", result.stdout)
+        self.assertFalse((self.root / "outputs").exists())
+
+    def test_syntax_and_lf(self):
+        self.assertNotIn(b"\r", SCRIPT.read_bytes())
+        result = subprocess.run([self.bash, "-n", SCRIPT.as_posix()], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
