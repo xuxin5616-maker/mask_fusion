@@ -52,7 +52,7 @@ def parse_args(argv=None):
     parser.add_argument("--log-every", type=int, default=10, help="Optimizer steps between loss reports")
     parser.add_argument("--save-every-steps", type=int, default=0, help="Also save resumable checkpoints at this interval; 0 = epoch only")
     parser.add_argument("--resume", help="Explicit checkpoint directory containing adapter and training_state.pt")
-    parser.add_argument("--init-adapter", help="Initialize a NEW run from adapter weights only; permits a new image mode, resets optimizer/scheduler, and cannot be combined with --resume")
+    parser.add_argument("--init-adapter", help="Initialize a NEW run from adapter weights only; permits a new image mode or enabling the direct residual MLP, resets optimizer/scheduler, and cannot be combined with --resume")
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
     args = parser.parse_args(argv)
     for name in ("epochs", "batch_size", "grad_accum", "max_text_length", "log_every"):
@@ -502,7 +502,8 @@ def _run_training(args, context=None):
     if args.init_adapter:
         from .model import load_adapter
 
-        load_adapter(model, args.init_adapter, allow_image_mode_change=True)
+        load_adapter(model, args.init_adapter, allow_image_mode_change=True,
+                     allow_direct_mlp_upgrade=True)
         _rank_zero_print({"event": "adapter_initialization", "source": initialization,
                          "message": "Loaded weights only; optimizer, scheduler and step count start fresh."}, context)
     if args.training_stage == "mask_pretrain":

@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 import copy
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -27,6 +28,8 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(FusionConfig.from_json(config.to_json()), config)
         self.assertEqual(config.expert_feature_dim, 130)
         self.assertEqual(config.prior_dim, 512)
+        self.assertFalse(config.direct_residual_mlp)
+        self.assertEqual(config.direct_mlp_hidden_size, 256)
         fusion = ExpertMaskFusion(vision_dim=1152, patch_size=14, config=config)
         self.assertEqual(fusion.layers[0].q_proj.in_features, 512)
         self.assertEqual(fusion.layers[0].k_proj.in_features, 512)
@@ -40,6 +43,8 @@ class ConfigurationTests(unittest.TestCase):
             {"position_dim": 6}, {"attention_dim": 10, "num_heads": 3},
             {"score_scale": 0}, {"score_scale": float("inf")},
             {"alpha_init": float("nan")}, {"normalize_e": "true"},
+            {"direct_residual_mlp": 1}, {"direct_mlp_hidden_size": 0},
+            {"direct_mlp_hidden_size": True}, {"direct_mlp_hidden_size": 2.5},
             {"mode": "unsupported"},
         )
         for values in cases:
@@ -47,6 +52,14 @@ class ConfigurationTests(unittest.TestCase):
                 FusionConfig(**values)
         with self.assertRaises(ValueError):
             FusionConfig.from_dict({"mask_hiden_size": 128})
+
+    def test_legacy_config_stays_disabled_and_residual_preset_is_explicit(self):
+        folder = Path(__file__).resolve().parents[1] / "configs"
+        legacy = FusionConfig.from_json((folder / "default.json").read_text())
+        residual = FusionConfig.from_json((folder / "residual_mlp.json").read_text())
+        self.assertFalse(legacy.direct_residual_mlp)
+        self.assertEqual(residual, replace(legacy, direct_residual_mlp=True,
+                                           direct_mlp_hidden_size=256))
 
 
 class MaskEncodingTests(unittest.TestCase):
@@ -286,6 +299,103 @@ class AttentionAndInitializationTests(unittest.TestCase):
         torch.testing.assert_close(outputs["both"][..., :6], outputs["attention"][..., :6])
         self.assertEqual(torch.count_nonzero(outputs["attention"][..., 6:]).item(), 0)
         self.assertEqual(torch.count_nonzero(outputs["none"][..., 6:]).item(), 0)
+
+
+class DirectResidualMLPTests(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(73)
+        self.config = small_config(direct_residual_mlp=True, direct_mlp_hidden_size=7)
+        self.fusion = ExpertMaskFusion(6, 2, self.config)
+        self.features = torch.randn(2, 4, 6)
+        self.masks = torch.rand(2, 1, 4, 4) * 255
+
+    def test_zero_initialization_preserves_shared_weights_and_outputs(self):
+        torch.manual_seed(73)
+        baseline = ExpertMaskFusion(6, 2, replace(self.config, direct_residual_mlp=False))
+        self.assertIsNone(baseline.direct_mlp)
+        self.assertFalse(any(key.startswith("direct_mlp.") for key in baseline.state_dict()))
+        for key, value in baseline.state_dict().items():
+            torch.testing.assert_close(value, self.fusion.state_dict()[key], rtol=0, atol=0)
+        self.assertEqual(self.fusion.direct_mlp[2].weight.count_nonzero().item(), 0)
+        self.assertEqual(self.fusion.direct_mlp[2].bias.count_nonzero().item(), 0)
+        self.assertGreater(self.fusion.direct_mlp[0].weight.count_nonzero().item(), 0)
+        for mask_only in (False, True):
+            with self.subTest(mask_only=mask_only):
+                expected = baseline(self.features, self.masks, mask_only=mask_only)
+                actual = self.fusion(self.features, self.masks, mask_only=mask_only)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_learning_changes_only_direct_hidden_features_and_preserves_prior(self):
+        fusion = self.fusion
+        before = fusion(self.features, self.masks).detach()
+        expert_before, valid, grid = fusion.encode_masks(self.masks)
+        prior_before = fusion.encode_prior(expert_before, grid, valid).detach()
+        expert_before = expert_before.detach()
+        target = torch.randn(2, 4, self.config.mask_hidden_size)
+        optimizer = torch.optim.SGD(fusion.direct_mlp.parameters(), lr=0.1)
+        for step in range(2):
+            fusion.zero_grad(set_to_none=True)
+            prediction = fusion(self.features, self.masks)[..., 6:10]
+            (prediction - target).square().mean().backward()
+            self.assertGreater(fusion.direct_mlp[2].weight.grad.abs().sum().item(), 0)
+            first_gradient = fusion.direct_mlp[0].weight.grad
+            self.assertTrue(torch.isfinite(first_gradient).all())
+            if step == 0:
+                self.assertEqual(first_gradient.count_nonzero().item(), 0)
+            else:
+                self.assertGreater(first_gradient.abs().sum().item(), 0)
+            # H's identity path keeps the mask CNN differentiable even while
+            # the new MLP's final layer starts at zero.
+            cnn_gradient = fusion.mask_encoder.patch_conv.weight.grad
+            self.assertGreater(cnn_gradient.abs().sum().item(), 0)
+            optimizer.step()
+        after = fusion(self.features, self.masks).detach()
+        expert_after, _, _ = fusion.encode_masks(self.masks)
+        prior_after = fusion.encode_prior(expert_after, grid, valid).detach()
+        torch.testing.assert_close(expert_after, expert_before, rtol=0, atol=0)
+        torch.testing.assert_close(prior_after, prior_before, rtol=0, atol=0)
+        torch.testing.assert_close(after[..., :6], before[..., :6], rtol=0, atol=0)
+        torch.testing.assert_close(after[..., -2:], before[..., -2:], rtol=0, atol=0)
+        self.assertFalse(torch.equal(after[..., 6:10], before[..., 6:10]))
+
+    def test_statistics_bypass_mlp_and_padding_stays_zero_after_learning_bias(self):
+        fusion = self.fusion
+        with torch.no_grad():
+            fusion.direct_mlp[2].weight.fill_(0.2)
+            fusion.direct_mlp[2].bias.fill_(3.0)
+        valid_pixels = torch.ones_like(self.masks, dtype=torch.bool)
+        valid_pixels[0] = False
+        valid_pixels[1, :, 2:, 2:] = False
+        valid_pixels[1, :, :2, 0] = False  # also exercise a partial patch
+        masks = self.masks.clone()
+        masks[~valid_pixels] = float("nan")
+        expert, valid_tokens, _ = fusion.encode_masks(masks, valid_pixels)
+        direct = fusion.encode_direct(expert, valid_tokens)
+        self.assertEqual(tuple(direct.shape), (2, 4, 6))
+        torch.testing.assert_close(direct[..., -2:], expert[..., -2:], rtol=0, atol=0)
+        self.assertEqual(direct[~valid_tokens].count_nonzero().item(), 0)
+        for mask_only in (False, True):
+            output = fusion(self.features, masks, valid_pixels, mask_only=mask_only)
+            self.assertTrue(torch.isfinite(output).all())
+            torch.testing.assert_close(output[..., 6:], direct, rtol=0, atol=0)
+            if mask_only:
+                self.assertEqual(output[..., :6].count_nonzero().item(), 0)
+        with self.assertRaisesRegex(ValueError, "valid_tokens"):
+            fusion.encode_direct(expert, torch.ones(1, 4, dtype=torch.bool))
+
+    def test_mlp_runs_only_for_enabled_direct_paths(self):
+        for mode in ("both", "direct", "attention", "none"):
+            with self.subTest(mode=mode):
+                fusion = ExpertMaskFusion(6, 2, replace(self.config, mode=mode))
+                with patch.object(fusion.direct_mlp, "forward", wraps=fusion.direct_mlp.forward) as call:
+                    output = fusion(self.features, None if mode == "none" else self.masks)
+                    self.assertEqual(call.call_count, int(mode in ("both", "direct")))
+                if mode in ("attention", "none"):
+                    self.assertEqual(output[..., 6:].count_nonzero().item(), 0)
+        with patch.object(self.fusion.direct_mlp, "forward", wraps=self.fusion.direct_mlp.forward) as call, \
+             patch.object(self.fusion, "encode_prior", side_effect=AssertionError("prior used in phase 1")):
+            self.fusion(self.features, self.masks, mask_only=True)
+            self.assertEqual(call.call_count, 1)
 
 
 class ProjectorExpansionTests(unittest.TestCase):

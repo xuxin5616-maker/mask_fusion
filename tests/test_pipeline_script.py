@@ -89,6 +89,8 @@ if [[ "${FAIL_STAGE:-}" == "$stage" ]]; then exit 23; fi
                     if " -m " in line]
         self.assertEqual(len(commands), 4, result.stdout)
         generated, pretrain, sft, test = commands
+        self.assertEqual(self.argument(pretrain, "--fusion-config"), "configs/residual_mlp.json")
+        self.assertEqual(self.argument(sft, "--fusion-config"), "configs/residual_mlp.json")
         self.assertEqual(self.argument(pretrain, "--data-root"), self.argument(generated, "--output"))
         self.assertEqual(self.argument(pretrain, "--val-data-root"), self.argument(generated, "--output"))
         self.assertEqual(self.argument(sft, "--init-adapter"), self.argument(pretrain, "--output"))
@@ -112,7 +114,10 @@ if [[ "${FAIL_STAGE:-}" == "$stage" ]]; then exit 23; fi
         self.assertEqual(sft[start + 1:start + 3], ["train one.json", "train two.jsonl"])
         self.assertEqual(self.argument(test, "--visualization-limit"), "0")
         self.assertEqual(self.argument(test, "--anomaly-prompt"), "category-mcq")
-        logs = self.root / "outputs/mask_reference_v1/logs"
+        self.assertEqual(self.argument(pretrain, "--output"), "outputs/mask_residual_mlp_v1/pretrain")
+        self.assertEqual(self.argument(sft, "--init-adapter"), "outputs/mask_residual_mlp_v1/pretrain")
+        self.assertEqual(self.argument(test, "--adapter"), "outputs/mask_residual_mlp_v1/sft")
+        logs = self.root / "outputs/mask_residual_mlp_v1/logs"
         self.assertEqual(len(list(logs.glob("*.log"))), 4)
         self.assertIn("fake stage 2", (logs / "2_pretrain.log").read_text())
 

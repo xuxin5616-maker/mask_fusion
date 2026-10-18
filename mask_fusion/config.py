@@ -29,11 +29,14 @@ class FusionConfig:
     normalize_e: bool = True
     score_scale: float = 255.0
     mode: str = "both"
+    direct_residual_mlp: bool = False
+    direct_mlp_hidden_size: int = 256
 
     def __post_init__(self) -> None:
         for name in (
             "mask_hidden_size", "expert_dim", "position_dim",
             "position_hidden_size", "attention_dim", "num_heads", "num_layers",
+            "direct_mlp_hidden_size",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -50,7 +53,7 @@ class FusionConfig:
                 raise ValueError(f"{name} must be a finite number")
         if self.score_scale <= 0:
             raise ValueError("score_scale must be positive")
-        for name in ("normalize_hidden", "normalize_e"):
+        for name in ("normalize_hidden", "normalize_e", "direct_residual_mlp"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a boolean")
         if self.mode not in ("both", "direct", "attention", "none"):

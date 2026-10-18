@@ -183,6 +183,17 @@ class ExpertMaskFusion(nn.Module):
         self.layers = nn.ModuleList(
             PriorAttentionLayer(vision_dim, config) for _ in range(config.num_layers)
         )
+        # Initialize after all existing modules so enabling this branch leaves
+        # their random initialization unchanged for the same seed.
+        self.direct_mlp = None
+        if config.direct_residual_mlp:
+            self.direct_mlp = nn.Sequential(
+                nn.Linear(config.mask_hidden_size, config.direct_mlp_hidden_size),
+                nn.GELU(),
+                nn.Linear(config.direct_mlp_hidden_size, config.mask_hidden_size),
+            )
+            nn.init.zeros_(self.direct_mlp[2].weight)
+            nn.init.zeros_(self.direct_mlp[2].bias)
 
     @property
     def expert_feature_dim(self) -> int:
@@ -192,6 +203,28 @@ class ExpertMaskFusion(nn.Module):
         self, masks: Tensor, mask_valid: Optional[Tensor] = None
     ) -> Tuple[Tensor, Tensor, Tuple[int, int]]:
         return self.mask_encoder(masks, mask_valid)
+
+    def encode_direct(
+        self, expert_features: Tensor, valid_tokens: Optional[Tensor] = None
+    ) -> Tensor:
+        """Adapt H only for the projector; preserve mean/max and the Q/K input.
+
+        This branch has no parameters when disabled. A zero-initialized final
+        layer makes the enabled residual branch an identity at initialization.
+        """
+        if expert_features.ndim != 3 or expert_features.shape[-1] != self.expert_feature_dim:
+            raise ValueError("expert_features must have shape [batch, patches, expert_feature_dim]")
+        direct = expert_features
+        if self.direct_mlp is not None:
+            hidden = expert_features[..., :self.config.mask_hidden_size]
+            statistics = expert_features[..., self.config.mask_hidden_size:]
+            direct = torch.cat((hidden + self.direct_mlp(hidden), statistics), dim=-1)
+        if valid_tokens is not None:
+            if valid_tokens.shape != expert_features.shape[:2]:
+                raise ValueError("valid_tokens must match batch and patch dimensions")
+            # Learned MLP biases must never turn padding into expert features.
+            direct = direct.masked_fill(~valid_tokens.unsqueeze(-1), 0.0)
+        return direct
 
     def encode_prior(
         self,
@@ -249,7 +282,8 @@ class ExpertMaskFusion(nn.Module):
             # Runtime phase-1 branch, not a persistent architecture ablation.
             # Keep the complete fusion forward as the FSDP/ZeRO entrypoint;
             # calling mask_encoder directly would bypass its parent's hooks.
-            return torch.cat((torch.zeros_like(image_features), expert), dim=-1)
+            direct = self.encode_direct(expert, valid_tokens)
+            return torch.cat((torch.zeros_like(image_features), direct), dim=-1)
         updated = image_features
         if self.config.mode in ("both", "attention"):
             prior = self.encode_prior(expert, grid_shape, valid_tokens)
@@ -258,8 +292,10 @@ class ExpertMaskFusion(nn.Module):
                 # visual stream is updated by preceding layers.
                 updated = layer(updated, prior, valid_tokens)
         if self.config.mode == "attention":
-            expert = torch.zeros_like(expert)
-        return torch.cat((updated, expert.to(dtype=updated.dtype)), dim=-1)
+            direct = torch.zeros_like(expert)
+        else:
+            direct = self.encode_direct(expert, valid_tokens)
+        return torch.cat((updated, direct.to(dtype=updated.dtype)), dim=-1)
 
 
 class SplitInputLinear(nn.Module):

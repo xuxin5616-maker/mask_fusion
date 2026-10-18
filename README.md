@@ -15,6 +15,11 @@ flowchart LR
     M --> S[patch 均值与最大值]
     H --> A[A: 130维]
     S --> A
+    H --> DMLP[直通 MLP: 128 → 256 → 128]
+    DMLP --> HR["H' = H + MLP(H)"]
+    H --> HR
+    HR --> AD[A_direct: 130维]
+    S --> AD
     A --> U[MLP: U 256维]
     P[固定二维位置编码128维] --> R[线性映射: R 256维]
     U --> E[通道拼接 E: 512维]
@@ -26,12 +31,12 @@ flowchart LR
     ATT --> RES[视觉残差 X + alpha deltaX]
     X --> RES
     RES --> CAT[通道拼接]
-    A --> CAT
+    AD --> CAT
     CAT --> PROJ[扩展并微调原 projector]
     PROJ --> LLM[冻结 Qwen LLM]
 ```
 
-单个 crop 的默认数据路径如下，省略 batch 维。视觉维度和 patch 大小从加载的 tower 读取；表内数字对应仓库的 SigLIP so400m-patch14-384。
+上图和下表对应一键流程默认的 `configs/residual_mlp.json`，省略 batch 维。旧版 `configs/default.json` 不启用直通残差 MLP，保留为对照。视觉维度和 patch 大小从加载的 tower 读取；表内数字对应仓库的 SigLIP so400m-patch14-384。
 
 | 阶段 | 计算 | 输出 |
 |---|---|---|
@@ -40,19 +45,23 @@ flowchart LR
 | mask 编码器 | `Conv(1,128,k14,s14) → GELU → Conv(128,128,k3,s1,p1) → GELU` | `128 × 27 × 27` |
 | H | 展平行优先 patch 网格，可选逐 token LayerNorm | `729 × 128` |
 | A | `[H; patch_mean; patch_max]` | `729 × 130` |
+| 直通残差 H' | `H' = H + Linear(256,128)(GELU(Linear(128,256)(H)))`，末层权重和偏置零初始化 | `729 × 128` |
+| A_direct | `[H'; patch_mean; patch_max]`，均值/最大值原样拼接 | `729 × 130` |
 | U | `Linear(130,256) → GELU → Linear(256,256)` | `729 × 256` |
 | R | 行/列整数坐标分别正余弦编码，再 `Linear(128,256)` | `729 × 256` |
 | E | **`[U;R]`，无额外压缩线性层** | `729 × 512` |
 | 注意力 | 默认对 E 做 LayerNorm，再独立 Q/K 投影；V 来自 X | 8 heads，每头 32 维 |
 | 视觉残差 | `X_tilde = X + alpha * W_O(attention(Q,K,V))` | `729 × 1152` |
-| projector 输入 | `[X_tilde;A]` | `729 × 1282` |
+| projector 输入 | `[X_tilde;A_direct]` | `729 × 1282` |
 | projector 输出 | 原有 LLM hidden size，继续原 token 打包流程 | token 数量沿用 baseline |
 
-公式中的位置编码、均值与最大值无可训练参数。CNN、U/R 映射、Q/K/V/O、融合系数和整个 projector 可训练。冻结 vision tower、Qwen 和外部专家；损失仍通过冻结 Qwen 反传到新模块。
+公式中的位置编码、均值与最大值无可训练参数。CNN、直通残差 MLP、U/R 映射、Q/K/V/O、融合系数和整个 projector 可训练。冻结 vision tower、Qwen 和外部专家；损失仍通过冻结 Qwen 反传到新模块。注意力的 U/E/Q/K 仍使用原始 `A=[H;mean;max]`；直通 MLP 只改变送往 projector 的 H，不处理均值/最大值，也不进入 Q/K 路径。
 
-默认只用一层注意力，不额外加入视觉 FFN。增加 `num_layers` 时，每层 Q/K 都来自相同的纯 mask/位置先验，V 来自上一层更新后的视觉特征。注意力在每个 crop 内独立计算。
+`num_layers=1` 表示一层 8 头注意力加视觉残差，不额外加入视觉 FFN。直通分支的残差 MLP 是独立的逐 patch 特征变换，不是第二层 Transformer。增加 `num_layers` 时，每层 Q/K 都来自相同的纯 mask/位置先验，V 来自上一层更新后的视觉特征。注意力在每个 crop 内独立计算。
 
-配置见 `configs/default.json`。128/256 维宽度、1 层、8 个头、`alpha_init=0.01`、H/E LayerNorm 都是可修改的起始设置，不是已验证的最优超参数。`normalize_e=false` 可关闭注意力先验的归一化；直接进入 projector 的均值/最大值不经过 H/E 的 LayerNorm。
+`configs/residual_mlp.json` 在旧 `configs/default.json` 上启用 `direct_residual_mlp=true` 和 `direct_mlp_hidden_size=256`，其余设置相同，包含 `num_layers=1`、8 个头、`alpha_init=0.01` 和 H/E LayerNorm。末层零初始化使新增直通分支初始满足 `H'=H`。这些宽度和层数是可修改的起始设置，不是已验证的最优超参数。`normalize_e=false` 可关闭注意力先验的归一化；直接进入 projector 的均值/最大值不经过 H/E 的 LayerNorm。
+
+旧 adapter 推理时按保存配置恢复旧结构；缺少新增配置字段的旧权重不会自动启用 MLP。需要升级时，显式使用 `--init-adapter 旧目录 --fusion-config configs/residual_mlp.json` 开始新实验：加载兼容的旧权重，并初始化新的残差 MLP；其余架构设置仍须匹配。`--resume` 不允许跨结构恢复旧优化器。
 
 2026-10-13 起，`scripts/train_zero3_2gpu.sh` 默认使用 `configs/default.json`，恢复 `normalize_hidden=true`，保留 `normalize_e=true`。两处归一化分别作用于每个 patch 的 128 维 CNN 特征 H，以及拼接后的 512 维 E；不对原始 mask 做逐图 min-max，也不对直接拼接的异常均值/最大值做 LayerNorm。`num_layers=1` 保持不变：新增模块为一层 8 头注意力加视觉残差，没有额外视觉 FFN。
 
@@ -76,12 +85,12 @@ projector 第一层复制旧视觉列、偏置和所有后续层，新增 130 �
 
 | config `mode` | projector 输入 | 可训练分支 |
 |---|---|---|
-| `both` | `[X_tilde;A]` | 全部新增模块 + projector |
-| `direct` | `[X;A]` | mask CNN + projector |
+| `both` | `[X_tilde;A_direct]` | 全部新增模块 + projector |
+| `direct` | `[X;A_direct]` | mask CNN、启用的直通 MLP + projector |
 | `attention` | `[X_tilde;0]` | mask CNN、先验和注意力 + projector |
 | `none` | `[X;0]` | projector，作为相同 SFT 下的图像基线 |
 
-每种模式应从相同原始 checkpoint 独立训练。对应配置为 `configs/default.json`、`direct.json`、`attention.json`、`none.json`。训练数据、裁剪、精度和后端应保持一致。`randomroi` 即使在 none 模式也可能用 mask 选框；若比较“不使用任何专家信息”，请统一使用 `anyres_max_9` 或 `square`。
+未启用直通 MLP 时 `A_direct=A`。旧版四种模式的配置为 `configs/default.json`、`direct.json`、`attention.json`、`none.json`；新增 `configs/residual_mlp.json` 是 `both` 模式的直通残差 MLP 版本。每种对照应从相同原始 checkpoint 独立训练，保持训练数据、裁剪、精度和后端一致。`randomroi` 即使在 none 模式也可能用 mask 选框；若比较“不使用任何专家信息”，请统一使用 `anyres_max_9` 或 `square`。
 
 ## 环境
 
@@ -432,9 +441,9 @@ ANOMALY_PROMPT=category-mcq bash scripts/test_mvtec.sh
 
 ## 合成 mask 预训练，再接真实数据 SFT
 
-新增入口 `python -m mask_fusion.pretrain`。第一阶段跳过 vision tower，在其输出位置构造零视觉特征，绕过注意力，只走 `[0; H; mean; max] → projector → 冻结 Qwen`。只更新 mask CNN、H 的 LayerNorm 和 projector 第一层新增的 mask 输入权重；原视觉输入权重、原 bias、projector 后续层、E 映射及注意力均冻结。首层视觉权重与 mask 权重物理拆分，AdamW 的 weight decay 也不会改动冻结部分。冻结 Qwen 仍保留反向传播到输入的计算图。
+新增入口 `python -m mask_fusion.pretrain`。第一阶段跳过 vision tower，在其输出位置构造零视觉特征，绕过注意力，只走 `[0; H'; mean; max] → projector → 冻结 Qwen`。启用新配置时 `H'=H+MLP(H)`，旧配置使用 `H'=H`。只更新 mask CNN、H 的 LayerNorm、启用的直通残差 MLP 和 projector 第一层新增的 mask 输入权重；原视觉输入权重、原 bias、projector 后续层、E 映射及注意力均冻结。首层视觉权重与 mask 权重物理拆分，AdamW 的 weight decay 也不会改动冻结部分。冻结 Qwen 仍保留反向传播到输入的计算图。
 
-预训练保存时把首层重新合并为标准 Linear，导出的 `adapter.safetensors` 可直接用于第二阶段的权重初始化。第一阶段新增 mask 列初始为零时，第一次更新主要发生在这些列；列更新后，后续步骤才会给 mask CNN 提供直接通路的梯度。
+预训练保存时把首层重新合并为标准 Linear，导出的 `adapter.safetensors` 可直接用于第二阶段的权重初始化。第一阶段新增 mask 列初始为零时，第一次更新主要发生在这些列；列更新后，后续步骤才会给 mask CNN 提供直接通路的梯度。新残差 MLP 的末层也从零开始，因此其首层需要末层先更新才获得非零数据梯度；这是初始化策略的预期行为。
 
 ### 一键执行生成、双卡预训练、真实数据 SFT 和测试
 
@@ -451,20 +460,24 @@ bash scripts/run_mask_pretrain_pipeline.sh
 START_STAGE=3 bash scripts/run_mask_pretrain_pipeline.sh
 
 # 新实验修改名称，各阶段默认输出路径会一起改变
-RUN_NAME=mask_reference_v2 bash scripts/run_mask_pretrain_pipeline.sh
+RUN_NAME=mask_residual_mlp_v2 bash scripts/run_mask_pretrain_pipeline.sh
+
+# 旧版无直通 MLP 对照，使用单独目录
+RUN_NAME=mask_without_direct_mlp_v1 FUSION_CONFIG=configs/default.json \
+  bash scripts/run_mask_pretrain_pipeline.sh
 ```
 
-默认生成 2,000/200 张训练/验证 mask；预训练和 SFT 均用 GPU `0,1`、FP32、3 epochs、单卡 batch 1、累积 4 步，测试使用 GPU `0`、FP32、类别 A/B 提示词并保存全部可视化。预训练固定 `square`；SFT 默认为 `randomroi`；测试从 SFT adapter 读取图像模式。SFT 通过 `--init-adapter` 接入预训练最终权重，继续训练整个 fusion 和 projector，vision tower/Qwen 保持冻结。
+一键流程默认使用 `configs/residual_mlp.json`，生成 2,000/200 张训练/验证 mask；预训练和 SFT 均用 GPU `0,1`、FP32、3 epochs、单卡 batch 1、累积 4 步，测试使用 GPU `0`、FP32、类别 A/B 提示词并保存全部可视化。预训练固定 `square`；SFT 默认为 `randomroi`；测试从 SFT adapter 读取图像模式。SFT 通过 `--init-adapter` 接入预训练最终权重，继续训练整个 fusion（包含新直通 MLP）和 projector，vision tower/Qwen 保持冻结。沿用原来的一键命令会进入新的 `mask_residual_mlp_v1` 实验目录；原 `mask_reference_v1` 结果保留。
 
 顶部可修改两份 `TRAIN_FILES`、可选 `VAL_FILES`、三个阶段各自的数据根目录、模型路径、GPU、学习率、epochs、生成数量和输出目录。数组路径用空格或换行分隔，不加逗号。`TRAIN_DATA_ROOT` 沿用此前 `/home/yz/xxy/data`，`TEST_DATA_ROOT` 为 `/home/yz/xxy/data/datasets`；请对应 JSON 内部的相对路径修改。合成数据的两个 root 均自动绑定到生成目录。相对路径统一以项目目录为基准。
 
-默认 `RUN_NAME=mask_reference_v1` 的输出为：
+默认 `RUN_NAME=mask_residual_mlp_v1` 的输出为：
 
-- 合成数据：`data/synthetic_masks_mask_reference_v1/`。
-- 预训练权重：`outputs/mask_reference_v1/pretrain/`；SFT 权重：`outputs/mask_reference_v1/sft/`。
-- 阶段日志：`outputs/mask_reference_v1/logs/{1_generate,2_pretrain,3_sft,4_test}.log`。
-- 测试结果：`results/mvtec_mask_reference_v1.jsonl` 和 `results/mvtec_mask_reference_v1.metrics.json`。
-- 全量可视化：`results/mvtec_mask_reference_v1_vis/`。
+- 合成数据：`data/synthetic_masks_mask_residual_mlp_v1/`。
+- 预训练权重：`outputs/mask_residual_mlp_v1/pretrain/`；SFT 权重：`outputs/mask_residual_mlp_v1/sft/`。
+- 阶段日志：`outputs/mask_residual_mlp_v1/logs/{1_generate,2_pretrain,3_sft,4_test}.log`。
+- 测试结果：`results/mvtec_mask_residual_mlp_v1.jsonl` 和 `results/mvtec_mask_residual_mlp_v1.metrics.json`。
+- 全量可视化：`results/mvtec_mask_residual_mlp_v1_vis/`。
 
 已有数据/训练输出/测试结果不会自动覆盖或跳过；重复全流程使用新的 `RUN_NAME`。`START_STAGE` / `END_STAGE` 取 1–4，例如 `END_STAGE=1` 只生成数据，`START_STAGE=4` 只测试已完成的 SFT。阶段中途失败需要恢复优化器时，使用原单阶段脚本的 `--resume`，不要把 `START_STAGE` 当作断点恢复。
 
@@ -504,13 +517,16 @@ python -m mask_fusion.synthetic_masks \
 
 ```bash
 # 先查看实际将执行的命令，不启动训练
-DRY_RUN=1 bash scripts/pretrain_mask_zero3_2gpu.sh
+DRY_RUN=1 bash scripts/pretrain_mask_zero3_2gpu.sh \
+  --fusion-config configs/residual_mlp.json --output outputs/mask_residual_mlp_pretrain_zero3
 
 # 默认使用物理 GPU 0、1，ZeRO-3，BF16；沿用 FP32 实验可显式覆盖
-CUDA_VISIBLE_DEVICES=0,1 bash scripts/pretrain_mask_zero3_2gpu.sh --dtype float32
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/pretrain_mask_zero3_2gpu.sh \
+  --dtype float32 --fusion-config configs/residual_mlp.json \
+  --output outputs/mask_residual_mlp_pretrain_zero3
 ```
 
-默认读取 `data/synthetic_masks/train.jsonl` 和 `val.jsonl`，输出到 `outputs/mask_pretrain_zero3`。支持 `SYNTHETIC_DATA_DIR`、`BASE_MODEL`、`OUTPUT_DIR`、`DATA_ROOT` 等环境变量，以及 `--data train1.jsonl train2.jsonl` / `--val-data val.jsonl` 多文件参数。相对图片路径默认相对于各 JSON；给合成数据沿用真实数据的 `DATA_ROOT` 会改变解析位置，通常无需设置。修改生成目录可用 `SYNTHETIC_DATA_DIR=新目录`。
+单阶段脚本保留旧默认：读取 `data/synthetic_masks/train.jsonl` 和 `val.jsonl`，使用 `configs/default.json`，输出到 `outputs/mask_pretrain_zero3`。上面的命令显式选择新残差 MLP 配置和独立输出目录。支持 `SYNTHETIC_DATA_DIR`、`BASE_MODEL`、`OUTPUT_DIR`、`DATA_ROOT` 等环境变量，以及 `--data train1.jsonl train2.jsonl` / `--val-data val.jsonl` 多文件参数。相对图片路径默认相对于各 JSON；给合成数据沿用真实数据的 `DATA_ROOT` 会改变解析位置，通常无需设置。修改生成目录可用 `SYNTHETIC_DATA_DIR=新目录`。
 
 沿用已有 DeepSpeed 依赖和 ZeRO-3 配置。预训练阶段冻结大模型仍需要通过 Qwen 做前向和输入梯度反传，因此并非只训练小 CNN 的计算成本。验证集会记录答案 token loss，并按最低验证 loss 保存 `best/`；合成验证 loss 不能代表真实缺陷准确率。
 
@@ -519,19 +535,24 @@ CUDA_VISIBLE_DEVICES=0,1 bash scripts/pretrain_mask_zero3_2gpu.sh --dtype float3
 ```bash
 DATA_ROOT=/home/yz/xxy/data/datasets \
 bash scripts/train_zero3_2gpu.sh \
-  --init-adapter outputs/mask_pretrain_zero3 \
+  --init-adapter outputs/mask_residual_mlp_pretrain_zero3 \
+  --fusion-config configs/residual_mlp.json \
   --data /absolute/path/train_a.json /absolute/path/train_b.json \
   --dtype float32 --image-mode randomroi \
-  --output outputs/zero3_after_mask_pretrain
+  --output outputs/zero3_after_mask_residual_mlp_pretrain
 ```
 
 将 `--data` 和 `DATA_ROOT` 换成原来真实训练使用的值；原脚本已填写 `TRAIN_FILES` 时可以省略 `--data`。`--init-adapter` 仅加载权重，重新初始化优化器、调度器和训练步数，显式允许从预训练 `square` 切换到真实训练的 `randomroi` / `anyres_max_9`。恢复真实图像、注意力和正常训练配置：训练整个 fusion 与整个 projector，继续冻结专家模型、vision tower 和 Qwen。两个阶段应使用相同的原 LLaVA checkpoint 和兼容的 fusion 配置。
 
-`--resume` 只用于同一阶段断点续训，不能和 `--init-adapter` 同时使用；直接把预训练 checkpoint 当作 SFT `--resume` 会报错。第二阶段再次续训只传自己的 `--resume`，无需再次提供预训练目录。第一阶段导出的是初始化权重，还不能据此宣称真实图像融合已经训练好。
+旧版无直通 MLP 的预训练 adapter 也可作为 `--init-adapter` 来源，配合 `--fusion-config configs/residual_mlp.json` 显式升级。仅允许新增这条残差分支，其余架构设置须兼容；新增末层零初始化，旧均值/最大值和注意力参数继续保留。
+
+`--resume` 只用于同一阶段、相同结构的断点续训，不能和 `--init-adapter` 同时使用；直接把预训练 checkpoint 当作 SFT `--resume`，或把旧无 MLP checkpoint 当作新结构续训，都会报错。第二阶段再次续训传自己的 `--resume` 并保留对应 `--fusion-config`，无需再次提供预训练目录。第一阶段导出的是初始化权重，还不能据此宣称真实图像融合已经训练好。
 
 2026-10-13：全项目 210 项 CPU 测试通过。本地验证使用随机初始化的 tiny Qwen，覆盖冻结参数、梯度、RGB 无影响、标准 adapter 导出、第一阶段断点恢复和第二阶段从新步数开始训练；没有运行真实 7B / 双 A100 的预训练，也没有验证模型收益。
 
 ## 验证与当前边界
+
+2026-10-18：残差 MLP 版本的全项目 **238 项 CPU 测试通过**，覆盖逐步梯度启动、冻结权重不变、保存加载的 logits 一致性、旧 adapter 显式升级、预训练断点恢复及后续 SFT。一键脚本 dry-run 已核对；尚未运行真实 7B / 双 A100 训练，测试结果不代表实际检测效果提升。
 
 ```bash
 python -m unittest discover -s tests -v

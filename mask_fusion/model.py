@@ -81,6 +81,8 @@ def configure_trainable(model):
         for module in (core.mask_fusion.expert_projection, core.mask_fusion.position_projection,
                        core.mask_fusion.prior_norm, core.mask_fusion.layers):
             module.requires_grad_(False)
+    elif mode == "attention" and core.mask_fusion.direct_mlp is not None:
+        core.mask_fusion.direct_mlp.requires_grad_(False)
     model.get_vision_tower().eval()
     model.config.use_cache = False
     return {"trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
@@ -90,8 +92,9 @@ def configure_trainable(model):
 def configure_mask_pretraining(model):
     """Configure phase 1 before creating an optimizer or a distributed wrapper.
 
-    Load any ordinary adapter first. Only the mask CNN/LN and the projector's
-    expert input columns are trainable. Qwen still propagates input gradients;
+    Load any ordinary adapter first. Only the mask CNN/LN, optional direct
+    residual MLP, and projector expert input columns are trainable.
+    Qwen still propagates input gradients;
     the vision tower and the prior-attention branch are skipped at runtime.
     The architecture config stays in mode='both' for phase-2 adapter loading.
     """
@@ -127,6 +130,8 @@ def configure_mask_pretraining(model):
     core.mask_fusion.float()
     core.mm_projector.float()
     core.mask_fusion.mask_encoder.requires_grad_(True)
+    if core.mask_fusion.direct_mlp is not None:
+        core.mask_fusion.direct_mlp.requires_grad_(True)
     first.expert_weight.requires_grad_(True)
     model.config.mask_fusion_pretrain = True
     model.config.use_cache = False
@@ -156,6 +161,10 @@ def read_adapter_config(path):
         metadata = json.load(handle)
     if metadata.get("format_version") != ADAPTER_VERSION:
         raise ValueError("Unsupported mask-fusion adapter format")
+    # Missing residual-MLP fields in older adapters mean the original structure.
+    # Normalize before equality checks so old inference/resume remain strict
+    # about actual architecture without rejecting newly added default fields.
+    metadata["fusion_config"] = FusionConfig.from_dict(metadata["fusion_config"]).to_dict()
     return metadata
 
 
@@ -296,19 +305,34 @@ def save_adapter(model, output, base_model, tokenizer=None, *, weights=None):
         tokenizer.save_pretrained(str(folder / "tokenizer"))
 
 
-def load_adapter(model, path, *, allow_image_mode_change=False):
+def load_adapter(model, path, *, allow_image_mode_change=False, allow_direct_mlp_upgrade=False):
     """Load the standard adapter, optionally transferring it to new image packing.
 
     Phase-2 initialization may explicitly change square pretraining to another
-    packing mode. Fusion architecture, dimensions, and exact weight keys must
-    still match. Resume callers retain the default strict packing check.
+    packing mode. Weight-only initialization may additionally enable the direct
+    residual MLP on an old adapter. Only those newly introduced keys may be
+    absent; all shared weights and other architecture settings must match.
+    Inference/resume callers retain strict architecture and packing checks.
     """
     from safetensors.torch import load_file
 
     folder = Path(path)
     metadata = read_adapter_config(folder)
-    for key, actual in (("fusion_config", model.config.mask_fusion),
-                        ("vision_dim", model.config.mask_fusion_vision_dim),
+    saved_fusion = metadata["fusion_config"]
+    actual_fusion = FusionConfig.from_dict(model.config.mask_fusion).to_dict()
+    upgrade = False
+    if saved_fusion != actual_fusion:
+        new_fields = {"direct_residual_mlp", "direct_mlp_hidden_size"}
+        upgrade = (
+            allow_direct_mlp_upgrade
+            and not saved_fusion["direct_residual_mlp"]
+            and actual_fusion["direct_residual_mlp"]
+            and {k: v for k, v in saved_fusion.items() if k not in new_fields}
+            == {k: v for k, v in actual_fusion.items() if k not in new_fields}
+        )
+        if not upgrade:
+            raise ValueError(f"Adapter/model mismatch for fusion_config: {saved_fusion!r} vs {actual_fusion!r}")
+    for key, actual in (("vision_dim", model.config.mask_fusion_vision_dim),
                         ("patch_size", model.config.mask_fusion_patch_size),
                         ("hidden_size", model.config.hidden_size),
                         ("mm_patch_merge_type", model.config.mm_patch_merge_type)):
@@ -321,8 +345,18 @@ def load_adapter(model, path, *, allow_image_mode_change=False):
     for prefix, module in (("mask_fusion", model.get_model().mask_fusion),
                            ("mm_projector", model.get_model().mm_projector)):
         expected.update(f"{prefix}.{key}" for key in module.state_dict())
-    if set(weights) != expected:
+    added = {key for key in expected if key.startswith("mask_fusion.direct_mlp.")} if upgrade else set()
+    if set(weights) != expected - added:
         raise ValueError("Adapter weights do not exactly match the fusion and projector state")
+    if upgrade:
+        direct_mlp = model.get_model().mask_fusion.direct_mlp
+        # Explicitly restore identity, including when a caller reuses a model
+        # whose residual branch has previously been trained or inspected.
+        with torch.no_grad():
+            direct_mlp[-1].weight.zero_()
+            direct_mlp[-1].bias.zero_()
+        weights.update({f"mask_fusion.direct_mlp.{key}": value.detach().cpu()
+                        for key, value in direct_mlp.state_dict().items()})
     for prefix, module in (("mask_fusion", model.get_model().mask_fusion),
                            ("mm_projector", model.get_model().mm_projector)):
         module.load_state_dict({key[len(prefix) + 1:]: value for key, value in weights.items()
