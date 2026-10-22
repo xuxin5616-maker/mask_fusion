@@ -445,7 +445,7 @@ ANOMALY_PROMPT=category-mcq bash scripts/test_mvtec.sh
 
 预训练保存时把首层重新合并为标准 Linear，导出的 `adapter.safetensors` 可直接用于第二阶段的权重初始化。第一阶段新增 mask 列初始为零时，第一次更新主要发生在这些列；列更新后，后续步骤才会给 mask CNN 提供直接通路的梯度。新残差 MLP 的末层也从零开始，因此其首层需要末层先更新才获得非零数据梯度；这是初始化策略的预期行为。
 
-### 一键执行生成、双卡预训练、真实数据 SFT 和测试
+### 一键执行生成、单卡/多卡预训练、真实数据 SFT 和测试
 
 修改 [scripts/run_mask_pretrain_pipeline.sh](scripts/run_mask_pretrain_pipeline.sh) 开头的配置区，然后在原来的训练环境运行：
 
@@ -455,6 +455,10 @@ DRY_RUN=1 bash scripts/run_mask_pretrain_pipeline.sh
 
 # 顺序执行全部阶段；任一步失败即停止，日志自动保存
 bash scripts/run_mask_pretrain_pipeline.sh
+
+# 数据已生成，使用 0 号卡完成预训练、SFT 和测试
+START_STAGE=2 TRAIN_GPUS=0 TEST_GPU=0 DTYPE=bfloat16 \
+  bash scripts/run_mask_pretrain_pipeline.sh
 
 # 同一实验的前两步已完成时，从真实数据训练开始（不是阶段内断点续训）
 START_STAGE=3 bash scripts/run_mask_pretrain_pipeline.sh
@@ -468,6 +472,10 @@ RUN_NAME=mask_without_direct_mlp_v1 FUSION_CONFIG=configs/default.json \
 ```
 
 一键流程默认使用 `configs/residual_mlp.json`，生成 2,000/200 张训练/验证 mask；预训练和 SFT 均用 GPU `0,1`、FP32、3 epochs、单卡 batch 1、累积 4 步，测试使用 GPU `0`、FP32、类别 A/B 提示词并保存全部可视化。预训练固定 `square`；SFT 默认为 `randomroi`；测试从 SFT adapter 读取图像模式。SFT 通过 `--init-adapter` 接入预训练最终权重，继续训练整个 fusion（包含新直通 MLP）和 projector，vision tower/Qwen 保持冻结。沿用原来的一键命令会进入新的 `mask_residual_mlp_v1` 实验目录；原 `mask_reference_v1` 结果保留。
+
+`TRAIN_GPUS` 决定训练卡数和编号：`TRAIN_GPUS=2` 使用 2 号卡，通过普通 `python -m` 和 `--distributed none` 训练，不需要 DeepSpeed；`TRAIN_GPUS=2,3` 使用两张卡，通过 ZeRO-3 分片训练。多卡进程数自动等于列表长度，编号不能重复。`TEST_GPU` 单独选择一张测试卡，单卡训练时可设成同一编号。单卡完整加载 7B 模型，不能获得多卡的参数分片省显存效果；示例使用 A100 支持的 BF16 减少显存，实际容量仍受视图数和文本长度影响。
+
+有效 batch 为 `训练卡数 × 每卡 batch × 梯度累积步数`。默认双卡为 8，单卡沿用默认累积 4 时为 4；需要保持 8 时同时设置 `PRETRAIN_GRAD_ACCUM=8 SFT_GRAD_ACCUM=8`。跨卡数或训练后端使用已训练权重初始化新阶段可通过 `--init-adapter`；阶段内 `--resume` 要沿用原后端和卡数。
 
 顶部可修改两份 `TRAIN_FILES`、可选 `VAL_FILES`、三个阶段各自的数据根目录、模型路径、GPU、学习率、epochs、生成数量和输出目录。数组路径用空格或换行分隔，不加逗号。`TRAIN_DATA_ROOT` 沿用此前 `/home/yz/xxy/data`，`TEST_DATA_ROOT` 为 `/home/yz/xxy/data/datasets`；请对应 JSON 内部的相对路径修改。合成数据的两个 root 均自动绑定到生成目录。相对路径统一以项目目录为基准。
 

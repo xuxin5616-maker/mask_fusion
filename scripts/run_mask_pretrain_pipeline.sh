@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# 完整流程：1 生成数据 -> 2 双卡 mask 预训练 -> 3 双卡真实数据 SFT -> 4 MVTec 测试。
+# 完整流程：1 生成数据 -> 2 mask 预训练 -> 3 真实数据 SFT -> 4 MVTec 测试。
 # 先激活原来训练成功的 conda 环境；只需修改下方配置区。
 # 运行：bash scripts/run_mask_pretrain_pipeline.sh
 # 预览：DRY_RUN=1 bash scripts/run_mask_pretrain_pipeline.sh（不创建文件、不启动 Python）
 # 已完成前两步：START_STAGE=3 bash scripts/run_mask_pretrain_pipeline.sh
+# 单卡：TRAIN_GPUS=0 TEST_GPU=0 DTYPE=bfloat16 START_STAGE=2 bash scripts/run_mask_pretrain_pipeline.sh
 # START_STAGE 只跳过已完成阶段，不会恢复阶段内中断的优化器状态。
 set -Eeuo pipefail
 
@@ -23,7 +24,8 @@ FUSION_CONFIG="${FUSION_CONFIG:-configs/residual_mlp.json}"
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-configs/zero3.json}"
 LOG_DIR="${LOG_DIR:-outputs/${RUN_NAME}/logs}"
 
-# GPU 是 CUDA_VISIBLE_DEVICES 的编号。两次训练均为双卡；测试只使用一张卡。
+# GPU 是 CUDA_VISIBLE_DEVICES 的编号。填一个用普通单卡训练；填多个用 ZeRO-3。
+# 例如 TRAIN_GPUS=2 用 2 号卡，TRAIN_GPUS=2,3 用 2、3 号卡；测试只使用一张卡。
 TRAIN_GPUS="${TRAIN_GPUS:-0,1}"
 TEST_GPU="${TEST_GPU:-0}"
 DTYPE="${DTYPE:-float32}"
@@ -94,9 +96,18 @@ selected() { (( START_STAGE <= $1 && $1 <= END_STAGE )); }
 require_file() { [[ -f "$1" ]] || fail "File not found: $1"; }
 
 # 在正式启动前检查外部输入；DRY_RUN 不依赖数据、模型或 GPU 的存在。
+train_world_size=1
 if selected 2 || selected 3; then
-    [[ "${TRAIN_GPUS}" =~ ^[^,[:space:]]+,[^,[:space:]]+$ ]] || fail 'TRAIN_GPUS must contain two comma-separated GPU IDs (e.g. 0,1).'
-    [[ "${TRAIN_GPUS%,*}" != "${TRAIN_GPUS#*,}" ]] || fail 'TRAIN_GPUS must select two different GPUs.'
+    [[ "${TRAIN_GPUS}" =~ ^[^,[:space:]]+(,[^,[:space:]]+)*$ ]] || fail 'TRAIN_GPUS must contain one or more comma-separated GPU IDs without spaces (e.g. 0 or 0,1).'
+    IFS=, read -r -a train_gpu_ids <<< "${TRAIN_GPUS}"
+    train_world_size=${#train_gpu_ids[@]}
+    seen_gpu_ids=()
+    for gpu_id in "${train_gpu_ids[@]}"; do
+        for seen_id in "${seen_gpu_ids[@]}"; do
+            [[ "${gpu_id}" != "${seen_id}" ]] || fail 'TRAIN_GPUS must select different GPUs.'
+        done
+        seen_gpu_ids+=("${gpu_id}")
+    done
 fi
 if selected 4; then
     [[ -n "${TEST_GPU}" && "${TEST_GPU}" != *,* && "${TEST_GPU}" != *[[:space:]]* ]] || fail 'TEST_GPU must select one GPU.'
@@ -112,7 +123,7 @@ if [[ "${DRY_RUN}" == "0" ]]; then
     fi
     if selected 2 || selected 3; then
         require_file "${FUSION_CONFIG}"
-        require_file "${DEEPSPEED_CONFIG}"
+        if (( train_world_size > 1 )); then require_file "${DEEPSPEED_CONFIG}"; fi
     fi
     if selected 3; then
         for manifest in "${TRAIN_FILES[@]}" "${VAL_FILES[@]}"; do require_file "${manifest}"; done
@@ -147,16 +158,21 @@ run_stage 1 generate \
     --size "${MASK_SIZE}" --seed "${SEED}" --preview-count "${PREVIEW_COUNT}"
 
 distributed_command=(
-    env "CUDA_VISIBLE_DEVICES=${TRAIN_GPUS}" "${PYTHON_BIN}" -m torch.distributed.run
-    --standalone --nproc_per_node=2 --module
+    env "CUDA_VISIBLE_DEVICES=${TRAIN_GPUS}" "${PYTHON_BIN}" -m
 )
 training_args=(
-    --distributed deepspeed --deepspeed-config "${DEEPSPEED_CONFIG}"
     --base-model "${BASE_MODEL}" --fusion-config "${FUSION_CONFIG}"
     --dtype "${DTYPE}" --attn-implementation "${ATTN_IMPLEMENTATION}"
     --num-workers "${NUM_WORKERS}" --log-every "${LOG_EVERY}"
     --max-text-length "${MAX_TEXT_LENGTH}" --seed "${SEED}"
 )
+if (( train_world_size == 1 )); then
+    # 普通单卡入口不初始化分布式进程组，也不依赖 DeepSpeed。
+    training_args+=(--distributed none --device cuda:0)
+else
+    distributed_command+=(torch.distributed.run --standalone "--nproc_per_node=${train_world_size}" --module)
+    training_args+=(--distributed deepspeed --deepspeed-config "${DEEPSPEED_CONFIG}")
+fi
 run_stage 2 pretrain \
     "${distributed_command[@]}" mask_fusion.pretrain "${training_args[@]}" \
     --data "${SYNTHETIC_DATA_DIR}/train.jsonl" \

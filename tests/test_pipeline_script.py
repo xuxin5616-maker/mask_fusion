@@ -96,6 +96,8 @@ if [[ "${FAIL_STAGE:-}" == "$stage" ]]; then exit 23; fi
         self.assertEqual(self.argument(sft, "--init-adapter"), self.argument(pretrain, "--output"))
         self.assertEqual(self.argument(test, "--adapter"), self.argument(sft, "--output"))
         self.assertIn("CUDA_VISIBLE_DEVICES=2,3", pretrain)
+        self.assertIn("--nproc_per_node=2", pretrain)
+        self.assertEqual(self.argument(pretrain, "--distributed"), "deepspeed")
         self.assertIn("CUDA_VISIBLE_DEVICES=3", test)
         self.assertNotIn("--image-mode", test)
         self.assertNotIn("--resume", sft)
@@ -129,6 +131,38 @@ if [[ "${FAIL_STAGE:-}" == "$stage" ]]; then exit 23; fi
         self.assertIn("2_pretrain failed", result.stderr)
         self.assertFalse((self.root / "calls/3.args").exists())
 
+    def test_single_gpu_uses_plain_training_without_deepspeed_config(self):
+        self.prepare_fake_python()
+        result = self.run_script(START_STAGE="2", TRAIN_GPUS="2", TEST_GPU="2",
+                                 DTYPE="bfloat16", DEEPSPEED_CONFIG="missing zero config.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "calls/order.txt").read_text().splitlines(), ["2", "3", "4"])
+        for stage in (2, 3):
+            command = self.command(stage)
+            self.assertEqual(command[0], "2")
+            self.assertEqual(command[2:4], ["-m", "mask_fusion.pretrain" if stage == 2 else "mask_fusion.train"])
+            self.assertEqual(self.argument(command, "--distributed"), "none")
+            self.assertEqual(self.argument(command, "--device"), "cuda:0")
+            self.assertEqual(self.argument(command, "--dtype"), "bfloat16")
+            self.assertNotIn("torch.distributed.run", command)
+            self.assertNotIn("--deepspeed-config", command)
+        self.assertEqual(self.command(4)[0], "2")
+
+    def test_process_count_matches_selected_gpus(self):
+        for gpu_ids, count in (("3", 1), ("1,3", 2), ("0,2,3", 3)):
+            with self.subTest(gpu_ids=gpu_ids):
+                result = self.run_script(START_STAGE="2", END_STAGE="3", TRAIN_GPUS=gpu_ids)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                commands = [shlex.split(line) for line in result.stdout.splitlines() if " -m " in line]
+                self.assertEqual(len(commands), 2)
+                for command in commands:
+                    self.assertIn("CUDA_VISIBLE_DEVICES=" + gpu_ids, command)
+                    if count == 1:
+                        self.assertNotIn("torch.distributed.run", command)
+                    else:
+                        self.assertIn("--nproc_per_node=" + str(count), command)
+                        self.assertEqual(self.argument(command, "--distributed"), "deepspeed")
+
     def test_stage_selection_and_visualization_disable(self):
         self.prepare_fake_python()
         result = self.run_script(START_STAGE="3", END_STAGE="4", VISUALIZE="0")
@@ -139,8 +173,9 @@ if [[ "${FAIL_STAGE:-}" == "$stage" ]]; then exit 23; fi
 
     def test_invalid_ranges_and_gpu_selection_fail_before_writing(self):
         for env in ({"START_STAGE": "0"}, {"END_STAGE": "5"}, {"START_STAGE": "word"},
-                    {"START_STAGE": "4", "END_STAGE": "2"}, {"TRAIN_GPUS": "0"},
-                    {"TRAIN_GPUS": "0,0"}, {"TEST_GPU": "0,1"}):
+                    {"START_STAGE": "4", "END_STAGE": "2"}, {"TRAIN_GPUS": ",0"},
+                    {"TRAIN_GPUS": "0,"}, {"TRAIN_GPUS": "0,,1"}, {"TRAIN_GPUS": "0, 1"},
+                    {"TRAIN_GPUS": "0,0"}, {"TRAIN_GPUS": "0,2,0"}, {"TEST_GPU": "0,1"}):
             with self.subTest(env=env):
                 result = self.run_script(**env)
                 self.assertEqual(result.returncode, 2, result.stderr)
