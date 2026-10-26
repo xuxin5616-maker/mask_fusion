@@ -1,0 +1,13 @@
+{
+  "mask_encoder_type": "siglip_jet",
+  "direct_residual_mlp": true,
+  "direct_mlp_hidden_size": 512,
+  "attention_dim": 256,
+  "num_heads": 8,
+  "num_layers": 1,
+  "alpha_init": 0.01,
+  "normalize_hidden": true,
+  "normalize_e": true,
+  "score_scale": 255.0,
+  "mode": "both"
+}

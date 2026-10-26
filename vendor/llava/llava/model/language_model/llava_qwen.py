@@ -452,11 +452,12 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         cache_position=None,
         masks=None,
         mask_valid=None,
+        mask_images=None,
         **loss_kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         if inputs_embeds is None:
-            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes, masks=masks, mask_valid=mask_valid)
+            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes, masks=masks, mask_valid=mask_valid, mask_images=mask_images)
 
         if dpo_forward:
             outputs = self.model(
@@ -499,6 +500,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         modalities: Optional[List[str]] = ["image"],
         masks=None,
         mask_valid=None,
+        mask_images=None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         position_ids = kwargs.pop("position_ids", None)
@@ -511,9 +513,9 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         if images is not None:
             # Preserve original reference LLaVA's generation inputs, including its None
             # mask/position_ids behavior. HF prepares the mask after packing.
-            (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes, masks=masks, mask_valid=mask_valid)
+            (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes, masks=masks, mask_valid=mask_valid, mask_images=mask_images)
         else:
-            if masks is not None or mask_valid is not None:
+            if masks is not None or mask_valid is not None or mask_images is not None:
                 raise ValueError("Masks require images")
             inputs_embeds = self.get_model().embed_tokens(inputs)
 

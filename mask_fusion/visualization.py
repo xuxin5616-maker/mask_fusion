@@ -166,6 +166,10 @@ def save_input_visualization(sample, record, source, processor, output_dir, inde
     if not metadata or "views" not in metadata:
         raise ValueError("Input visualization requires preprocessing metadata from QADataset")
     rgb_views = restore_rgb_views(sample["images"], processor)
+    mask_rgb_views = (restore_rgb_views(sample["mask_images"], processor)
+                      if "mask_images" in sample else None)
+    if mask_rgb_views is not None and len(mask_rgb_views) != len(rgb_views):
+        raise ValueError("SigLIP mask/image visualization view counts do not match")
     masks = sample["masks"].detach().float().cpu().numpy()
     valid = sample["mask_valid"].detach().cpu().numpy().astype(bool, copy=False)
     if masks.shape != valid.shape or masks.shape != (len(rgb_views), 1, rgb_views[0].height, rgb_views[0].width):
@@ -197,6 +201,12 @@ def save_input_visualization(sample, record, source, processor, output_dir, inde
             filename = f"{stem}_{name}.png"
             panel.save(folder / filename)
             filenames[name] = filename
+        if mask_rgb_views is not None:
+            # Preserve the actual Jet encoder input separately from the scalar
+            # score display, which uses its own explanatory color scale.
+            filename = f"{stem}_siglip_mask_input.png"
+            mask_rgb_views[view_index].save(folder / filename)
+            filenames["siglip_mask_input"] = filename
         row_label = f"Input {view_index:02d}: {view['kind']} ({rgb.width} x {rgb.height})"
         rows.append((row_label, (rgb, heatmap, overlay)))
         selected_scores = masks[view_index, 0][valid[view_index, 0]]

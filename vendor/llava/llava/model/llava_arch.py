@@ -31,13 +31,13 @@ from llava.utils import rank0_print, rank_print
 import random
 
 
-def _flatten_mask_views(values, image_views, name):
+def _flatten_mask_views(values, image_views, name, channels=1):
     """Keep expert maps in the exact sample/crop order used for vision encoding."""
     if values is None:
         return None
     if not isinstance(values, (list, tuple)):
         if values.ndim != 5:
-            raise ValueError(f"{name} must be a list of crop tensors or [B,V,1,H,W]")
+            raise ValueError(f"{name} must be a list of crop tensors or [B,V,{channels},H,W]")
         values = list(values)
     if len(values) != len(image_views):
         raise ValueError(f"{name} and images have different batch sizes")
@@ -45,7 +45,7 @@ def _flatten_mask_views(values, image_views, name):
     for value, pixels in zip(values, image_views):
         if value.ndim == 3:
             value = value.unsqueeze(0)
-        if (value.ndim != 4 or value.shape[1] != 1 or
+        if (value.ndim != 4 or value.shape[1] != channels or
                 value.shape[0] != pixels.shape[0] or value.shape[-2:] != pixels.shape[-2:]):
             raise ValueError(f"{name} must match every image crop's count and spatial size")
         result.append(value)
@@ -202,10 +202,47 @@ class LlavaMetaForCausalLM(ABC):
         image_feature = image_feature.view(num_frames, -1, num_dim)
         return image_feature
 
-    def encode_images(self, images, masks=None, mask_valid=None):
+    def encode_images(self, images, masks=None, mask_valid=None, mask_images=None):
         core = self.get_model()
         mask_only = bool(getattr(self.config, "mask_fusion_pretrain", False))
-        if mask_only:
+        fusion = getattr(core, "mask_fusion", None)
+        jet_encoder = (fusion is not None and fusion.config.mask_encoder_type == "siglip_jet")
+        expert_features = valid_tokens = None
+        if jet_encoder and (mask_only or fusion.config.mode != "none"):
+            if (not isinstance(mask_images, torch.Tensor) or mask_images.ndim != 4
+                    or mask_images.shape[1] != 3 or not mask_images.is_floating_point()
+                    or mask_images.shape[0] != images.shape[0]
+                    or mask_images.shape[-2:] != images.shape[-2:]):
+                raise ValueError("Jet-SigLIP requires preprocessed mask_images [views,3,H,W] aligned with images")
+            if not torch.isfinite(mask_images).all():
+                raise ValueError("Preprocessed Jet mask pixels must be finite")
+            if masks is not None and (masks.ndim != 4 or masks.shape[1] != 1
+                    or masks.shape[0] != images.shape[0] or masks.shape[-2:] != images.shape[-2:]):
+                raise ValueError("Scalar masks must match Jet mask/image views")
+            if mask_valid is None:
+                valid = torch.ones_like(mask_images[:, :1], dtype=torch.bool)
+            else:
+                valid = mask_valid.unsqueeze(1) if mask_valid.ndim == 3 else mask_valid
+                if (valid.shape != mask_images[:, :1].shape or valid.is_complex()
+                        or not torch.all((valid == 0) | (valid == 1))):
+                    raise ValueError("mask_valid must contain aligned binary [views,1,H,W] pixels")
+                valid = valid.to(device=mask_images.device, dtype=torch.bool)
+            tower = core.get_vision_tower()
+            tower.eval()
+            # Reuse the SAME frozen tower/checkpoint as RGB. Only this encoder
+            # runs without autograd; downstream adapters and Qwen keep gradients.
+            with torch.no_grad():
+                expert_features = tower(mask_images)
+            valid_tokens = nn.functional.max_pool2d(
+                valid.float(), kernel_size=fusion.patch_size, stride=fusion.patch_size,
+            ).flatten(1).bool()
+            if valid_tokens.shape != expert_features.shape[:2]:
+                raise ValueError("SigLIP mask patch grid differs from the validity grid")
+        elif mask_images is not None and not jet_encoder:
+            raise ValueError("mask_images require a Jet-SigLIP fusion configuration")
+        if mask_only and jet_encoder:
+            image_features = torch.zeros_like(expert_features)
+        elif mask_only:
             if not hasattr(core, "mask_fusion") or masks is None:
                 raise ValueError("Mask pretraining requires an attached fusion module and aligned masks")
             if (not isinstance(masks, torch.Tensor) or masks.ndim != 4 or masks.shape[1] != 1
@@ -213,7 +250,7 @@ class LlavaMetaForCausalLM(ABC):
                     or masks.shape[0] != images.shape[0] or masks.shape[-2:] != images.shape[-2:]):
                 raise ValueError("Mask pretraining requires [B,1,H,W] masks aligned with image placeholders")
             parameter = next(core.mask_fusion.parameters())
-            patch_size = core.mask_fusion.mask_encoder.patch_size
+            patch_size = core.mask_fusion.patch_size
             height, width = masks.shape[-2:]
             image_features = torch.zeros(
                 masks.shape[0], (height // patch_size) * (width // patch_size),
@@ -223,16 +260,24 @@ class LlavaMetaForCausalLM(ABC):
             image_features = core.get_vision_tower()(images)
         # image_features = core.vision_resampler(image_features, images=images)
         if hasattr(core, "mask_fusion"):
-            if masks is None and core.mask_fusion.config.mode != "none":
+            if masks is None and not jet_encoder and core.mask_fusion.config.mode != "none":
                 raise ValueError("An enabled mask-fusion model requires aligned continuous masks")
             parameter = next(core.mask_fusion.parameters())
+            fusion_inputs = {}
+            if jet_encoder:
+                fusion_inputs = {
+                    "expert_features": None if expert_features is None else expert_features.to(
+                        device=parameter.device, dtype=parameter.dtype),
+                    "valid_tokens": None if valid_tokens is None else valid_tokens.to(parameter.device),
+                }
             image_features = core.mask_fusion(
                 image_features.to(device=parameter.device, dtype=parameter.dtype),
                 None if masks is None else masks.to(parameter.device),
                 None if mask_valid is None else mask_valid.to(parameter.device),
                 mask_only=mask_only,
+                **fusion_inputs,
             )
-        elif masks is not None or mask_valid is not None:
+        elif masks is not None or mask_valid is not None or mask_images is not None:
             raise ValueError("Expert masks were supplied without an attached mask-fusion module")
         parameter = next(core.mm_projector.parameters())
         image_features = core.mm_projector(image_features.to(parameter.dtype))
@@ -269,7 +314,7 @@ class LlavaMetaForCausalLM(ABC):
         image_feature = image_feature.permute(1, 2, 0).contiguous()
         return image_feature
 
-    def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None, masks=None, mask_valid=None):
+    def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None, masks=None, mask_valid=None, mask_images=None):
         vision_tower = self.get_vision_tower()
         # rank_print(modalities)
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
@@ -349,7 +394,12 @@ class LlavaMetaForCausalLM(ABC):
             #print(split_sizes)
             concat_masks = _flatten_mask_views(masks, images_list, "masks")
             concat_valid = _flatten_mask_views(mask_valid, images_list, "mask_valid")
-            encoded_image_features = self.encode_images(concat_images, concat_masks, concat_valid)
+            concat_mask_images = _flatten_mask_views(mask_images, images_list, "mask_images", channels=3)
+            if concat_mask_images is None:
+                encoded_image_features = self.encode_images(concat_images, concat_masks, concat_valid)
+            else:
+                encoded_image_features = self.encode_images(
+                    concat_images, concat_masks, concat_valid, mask_images=concat_mask_images)
 
             # This is a list, each element is [num_images, patch * patch, dim]
             # rank_print(f"Concat images : {concat_images.shape}")
@@ -594,7 +644,10 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_features = self.encode_images(images, masks, mask_valid)
+            if mask_images is None:
+                image_features = self.encode_images(images, masks, mask_valid)
+            else:
+                image_features = self.encode_images(images, masks, mask_valid, mask_images=mask_images)
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(self.config, "mm_use_im_start_end", False):

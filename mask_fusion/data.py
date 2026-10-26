@@ -359,6 +359,8 @@ class QADataset(Dataset):
         )
         for name in ("images", "masks", "mask_valid", "image_size"):
             sample[name] = prepared[name]
+        if "mask_images" in prepared:
+            sample["mask_images"] = prepared["mask_images"]
         if not self.training and "metadata" in prepared:
             # Diagnostics only; collate_samples never forwards this to the LLM.
             sample["preprocessing_metadata"] = prepared["metadata"]
@@ -395,6 +397,11 @@ def collate_samples(batch: Sequence[Mapping[str, Any]], pad_token_id: int) -> Di
         "image_sizes": [sample["image_size"] for sample in batch],
         "modalities": ["image"] * len(batch),
     }
+    has_mask_images = ["mask_images" in sample for sample in batch]
+    if any(has_mask_images):
+        if not all(has_mask_images):
+            raise ValueError("Cannot mix Jet-SigLIP and CNN mask samples in a batch")
+        result["mask_images"] = [sample["mask_images"] for sample in batch]
     if labels is not None:
         result["labels"] = labels
     return result

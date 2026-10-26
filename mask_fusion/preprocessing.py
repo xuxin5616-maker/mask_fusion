@@ -1,7 +1,8 @@
 """Keep continuous expert scores in the exact coordinate frame of each image view.
 
-RGB pixels are processed by the bundled baseline. Scores never pass through the
-RGB processor: they remain nonnegative float32 values in their original units.
+RGB pixels are processed by the bundled baseline. Scalar masks remain float32
+in their original units. The optional SigLIP mask path colorizes the aligned
+scores with fixed-range Jet before applying the same RGB processor once.
 """
 
 from contextlib import contextmanager
@@ -19,6 +20,70 @@ _RNG_LOCK = threading.Lock()
 _BILINEAR = getattr(Image, "Resampling", Image).BILINEAR
 _NEAREST = getattr(Image, "Resampling", Image).NEAREST
 _MODES = {"square", "anyres_max_9", "randomroi", "randompatch"}
+
+
+def _make_jet_rgb_lut():
+    # Matplotlib's standard 256-entry jet, gamma=1, RGB byte output. These are
+    # its channel breakpoints, not OpenCV's BGR map or a generic rainbow:
+    # https://github.com/matplotlib/matplotlib/blob/v3.10.8/lib/matplotlib/_cm.py#L225-L240
+    # Sample/interpolate on the 0..255 grid as LinearSegmentedColormap does;
+    # byte conversion truncates (rather than rounds) channel * 255.
+    channels = (
+        ((0.00, 0.0), (0.35, 0.0), (0.66, 1.0), (0.89, 1.0), (1.00, 0.5)),
+        ((0.000, 0.0), (0.125, 0.0), (0.375, 1.0), (0.640, 1.0), (0.910, 0.0), (1.000, 0.0)),
+        ((0.00, 0.5), (0.11, 1.0), (0.34, 1.0), (0.65, 0.0), (1.00, 0.0)),
+    )
+    samples = np.linspace(0.0, 1.0, 256) * 255
+    colors = []
+    for channel in channels:
+        points = np.asarray(channel, dtype=np.float64)
+        positions, values = points[:, 0] * 255, points[:, 1]
+        right = np.searchsorted(positions, samples).clip(1, len(points) - 1)
+        fraction = (samples - positions[right - 1]) / (positions[right] - positions[right - 1])
+        colors.append(fraction * (values[right] - values[right - 1]) + values[right - 1])
+    table = (np.clip(np.stack(colors, axis=-1), 0.0, 1.0) * 255).astype(np.uint8)
+    table.setflags(write=False)
+    return table
+
+
+_JET_RGB_LUT = _make_jet_rgb_lut()
+
+
+def scores_to_jet_rgb(scores, valid=None, score_scale=255.0):
+    """Return an HxWx3 uint8 RGB array using Matplotlib's standard 256-bin Jet.
+
+    Scores use the fixed range [0, score_scale], never per-image min/max. Float
+    inputs index the LUT with floor(256 * score / score_scale), with the upper
+    endpoint assigned to entry 255, matching Matplotlib colormap semantics.
+    ``valid`` is an optional same-shaped boolean array. Only valid pixels must
+    be finite and within range; all invalid pixels become neutral (128,128,128),
+    including when their scores are NaN or infinity. Input arrays are unchanged.
+    """
+    if (isinstance(score_scale, (bool, np.bool_))
+            or not isinstance(score_scale, (int, float, np.integer, np.floating))
+            or not math.isfinite(float(score_scale)) or score_scale <= 0):
+        raise ValueError("score_scale must be a finite positive number")
+    scores = np.asarray(scores)
+    if scores.ndim != 2 or min(scores.shape, default=0) <= 0:
+        raise ValueError("Jet scores must be a nonempty 2D scalar score map")
+    if (not (np.issubdtype(scores.dtype, np.number) or scores.dtype == np.bool_)
+            or np.iscomplexobj(scores)):
+        raise ValueError("Jet scores must contain real numeric values")
+    if valid is None:
+        valid = np.ones(scores.shape, dtype=bool)
+    else:
+        valid = np.asarray(valid)
+        if valid.shape != scores.shape or valid.dtype != np.bool_:
+            raise ValueError("Jet valid mask must be boolean and have the same HW shape as scores")
+    values = scores[valid].astype(np.float64)
+    if not np.isfinite(values).all():
+        raise ValueError("Valid Jet scores must be finite")
+    if ((values < 0) | (values > float(score_scale))).any():
+        raise ValueError(f"Valid Jet scores must lie in [0, {float(score_scale):g}]")
+    rgb = np.full((*scores.shape, 3), 128, dtype=np.uint8)
+    indices = np.minimum((values / float(score_scale) * 256).astype(np.int64), 255)
+    rgb[valid] = _JET_RGB_LUT[indices]
+    return rgb
 
 
 def _validate_mask(mask):
@@ -161,6 +226,12 @@ def prepare_image_mask(image, mask, processor, model_config, *, mode="anyres_max
     ``metadata``. Invalid padded score pixels are zero. Mask values are NOT
     divided by 255, normalized, clipped, or binarized.
 
+    When ``model_config.mask_fusion['mask_encoder_type'] == 'siglip_jet'``,
+    also returns floating ``mask_images[V,3,S,S]``. Each already-aligned score
+    view is colorized with fixed-range Jet and processed once by ``processor``;
+    no crops are selected again. Invalid pixels are neutral RGB 128 before the
+    processor's ordinary rescale/normalization. The scalar masks stay unchanged.
+
     ``boxes`` use the baseline's INCLUSIVE original-image ``[x0,y0,x1,y1]``
     convention, with at most four boxes. Metadata records the actual HALF-OPEN
     PIL crop boxes, including ``x1+1,y1+1``. Out-of-image crop pixels are invalid.
@@ -290,10 +361,26 @@ def prepare_image_mask(image, mask, processor, model_config, *, mode="anyres_max
     mask_array[~valid_array] = 0
     if not np.isfinite(mask_array).all() or (mask_array < 0).any():
         raise ValueError("Mask preprocessing produced invalid scores")
-    return {
+    result = {
         "images": images,
         "masks": torch.from_numpy(mask_array[:, None]),
         "mask_valid": torch.from_numpy(valid_array[:, None]),
         "image_size": image_size,
         "metadata": metadata,
     }
+    fusion_config = getattr(model_config, "mask_fusion", None)
+    if isinstance(fusion_config, dict) and fusion_config.get("mask_encoder_type") == "siglip_jet":
+        score_scale = fusion_config.get("score_scale", 255.0)
+        jet_views = [Image.fromarray(scores_to_jet_rgb(scores, valid, score_scale))
+                     for scores, valid in zip(mask_array, valid_array)]
+        mask_images = processor.preprocess(jet_views, return_tensors="pt")["pixel_values"]
+        if (not isinstance(mask_images, torch.Tensor) or mask_images.shape != images.shape
+                or not mask_images.is_floating_point() or not torch.isfinite(mask_images).all()):
+            raise ValueError("Jet processor must return finite floating mask_images with the same [V,3,S,S] shape as images")
+        result["mask_images"] = mask_images
+        metadata["mask_image_encoding"] = {
+            "colormap": "matplotlib_jet_256", "color_order": "RGB",
+            "score_range": [0.0, float(score_scale)], "padding_rgb": [128, 128, 128],
+            "colorize_after_geometry": True, "processor_passes_per_view": 1,
+        }
+    return result

@@ -80,9 +80,13 @@ def configure_trainable(model):
     elif mode == "direct":
         for module in (core.mask_fusion.expert_projection, core.mask_fusion.position_projection,
                        core.mask_fusion.prior_norm, core.mask_fusion.layers):
-            module.requires_grad_(False)
+            if module is not None:
+                module.requires_grad_(False)
     elif mode == "attention" and core.mask_fusion.direct_mlp is not None:
         core.mask_fusion.direct_mlp.requires_grad_(False)
+        direct_norm = getattr(core.mask_fusion, "direct_norm", None)
+        if direct_norm is not None:
+            direct_norm.requires_grad_(False)
     model.get_vision_tower().eval()
     model.config.use_cache = False
     return {"trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
@@ -92,10 +96,11 @@ def configure_trainable(model):
 def configure_mask_pretraining(model):
     """Configure phase 1 before creating an optimizer or a distributed wrapper.
 
-    Load any ordinary adapter first. Only the mask CNN/LN, optional direct
-    residual MLP, and projector expert input columns are trainable.
+    Load any ordinary adapter first. Only the CNN/LN (legacy encoder), direct
+    residual MLP/norm, and projector expert input columns are trainable.
     Qwen still propagates input gradients;
-    the vision tower and the prior-attention branch are skipped at runtime.
+    the RGB vision path and prior-attention branch are skipped at runtime.
+    Jet masks still run through the shared frozen SigLIP tower.
     The architecture config stays in mode='both' for phase-2 adapter loading.
     """
     core = model.get_model()
@@ -129,9 +134,13 @@ def configure_mask_pretraining(model):
     model.zero_grad(set_to_none=True)
     core.mask_fusion.float()
     core.mm_projector.float()
-    core.mask_fusion.mask_encoder.requires_grad_(True)
+    if core.mask_fusion.mask_encoder is not None:
+        core.mask_fusion.mask_encoder.requires_grad_(True)
     if core.mask_fusion.direct_mlp is not None:
         core.mask_fusion.direct_mlp.requires_grad_(True)
+    direct_norm = getattr(core.mask_fusion, "direct_norm", None)
+    if direct_norm is not None:
+        direct_norm.requires_grad_(True)
     first.expert_weight.requires_grad_(True)
     model.config.mask_fusion_pretrain = True
     model.config.use_cache = False
@@ -325,6 +334,7 @@ def load_adapter(model, path, *, allow_image_mode_change=False, allow_direct_mlp
         new_fields = {"direct_residual_mlp", "direct_mlp_hidden_size"}
         upgrade = (
             allow_direct_mlp_upgrade
+            and saved_fusion["mask_encoder_type"] == "cnn"
             and not saved_fusion["direct_residual_mlp"]
             and actual_fusion["direct_residual_mlp"]
             and {k: v for k, v in saved_fusion.items() if k not in new_fields}

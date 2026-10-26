@@ -120,12 +120,15 @@ class MaskPatchEncoder(nn.Module):
 class PriorAttentionLayer(nn.Module):
     """Attention whose Q/K depend only on mask/location, never visual content."""
 
-    def __init__(self, vision_dim: int, config: FusionConfig) -> None:
+    def __init__(self, vision_dim: int, config: FusionConfig, prior_dim: Optional[int] = None) -> None:
         super().__init__()
         self.num_heads = config.num_heads
         self.head_dim = config.attention_dim // config.num_heads
-        self.q_proj = nn.Linear(config.prior_dim, config.attention_dim)
-        self.k_proj = nn.Linear(config.prior_dim, config.attention_dim)
+        prior_dim = config.prior_dim if prior_dim is None else prior_dim
+        if isinstance(prior_dim, bool) or not isinstance(prior_dim, int) or prior_dim < 1:
+            raise ValueError("prior_dim must be a positive integer")
+        self.q_proj = nn.Linear(prior_dim, config.attention_dim)
+        self.k_proj = nn.Linear(prior_dim, config.attention_dim)
         self.v_proj = nn.Linear(vision_dim, config.attention_dim)
         self.out_proj = nn.Linear(config.attention_dim, vision_dim)
         self.alpha = nn.Parameter(torch.tensor(float(config.alpha_init)))
@@ -172,53 +175,72 @@ class ExpertMaskFusion(nn.Module):
         self.vision_dim = vision_dim
         self.patch_size = patch_size
         self.config = config
-        self.mask_encoder = MaskPatchEncoder(patch_size, config)
-        self.expert_projection = nn.Sequential(
-            nn.Linear(config.expert_feature_dim, config.expert_dim),
-            nn.GELU(),
-            nn.Linear(config.expert_dim, config.expert_dim),
-        )
-        self.position_projection = nn.Linear(config.position_dim, config.position_hidden_size)
-        self.prior_norm = nn.LayerNorm(config.prior_dim) if config.normalize_e else nn.Identity()
+        if config.mask_encoder_type == "cnn":
+            self.mask_encoder = MaskPatchEncoder(patch_size, config)
+            self.expert_projection = nn.Sequential(
+                nn.Linear(config.expert_feature_dim, config.expert_dim),
+                nn.GELU(),
+                nn.Linear(config.expert_dim, config.expert_dim),
+            )
+            self.position_projection = nn.Linear(config.position_dim, config.position_hidden_size)
+            self.prior_dim = config.prior_dim
+        else:
+            # SigLIP features are extracted by the shared, frozen vision tower
+            # outside this module. No second tower or scalar-mask CNN is owned.
+            self.mask_encoder = None
+            self.expert_projection = None
+            self.position_projection = None
+            self.prior_dim = vision_dim
+        self.prior_norm = nn.LayerNorm(self.prior_dim) if config.normalize_e else nn.Identity()
         self.layers = nn.ModuleList(
-            PriorAttentionLayer(vision_dim, config) for _ in range(config.num_layers)
+            PriorAttentionLayer(vision_dim, config, prior_dim=self.prior_dim)
+            for _ in range(config.num_layers)
         )
         # Initialize after all existing modules so enabling this branch leaves
         # their random initialization unchanged for the same seed.
         self.direct_mlp = None
+        self.direct_norm = None
         if config.direct_residual_mlp:
+            direct_dim = vision_dim if config.mask_encoder_type == "siglip_jet" else config.mask_hidden_size
+            if config.mask_encoder_type == "siglip_jet":
+                self.direct_norm = nn.LayerNorm(direct_dim)
             self.direct_mlp = nn.Sequential(
-                nn.Linear(config.mask_hidden_size, config.direct_mlp_hidden_size),
+                nn.Linear(direct_dim, config.direct_mlp_hidden_size),
                 nn.GELU(),
-                nn.Linear(config.direct_mlp_hidden_size, config.mask_hidden_size),
+                nn.Linear(config.direct_mlp_hidden_size, direct_dim),
             )
             nn.init.zeros_(self.direct_mlp[2].weight)
             nn.init.zeros_(self.direct_mlp[2].bias)
 
     @property
     def expert_feature_dim(self) -> int:
-        return self.config.expert_feature_dim
+        return self.vision_dim if self.config.mask_encoder_type == "siglip_jet" else self.config.expert_feature_dim
 
     def encode_masks(
         self, masks: Tensor, mask_valid: Optional[Tensor] = None
     ) -> Tuple[Tensor, Tensor, Tuple[int, int]]:
+        if self.mask_encoder is None:
+            raise ValueError("siglip_jet requires externally extracted expert_features")
         return self.mask_encoder(masks, mask_valid)
 
     def encode_direct(
         self, expert_features: Tensor, valid_tokens: Optional[Tensor] = None
     ) -> Tensor:
-        """Adapt H only for the projector; preserve mean/max and the Q/K input.
+        """Adapt the direct projector path without changing the Q/K input.
 
-        This branch has no parameters when disabled. A zero-initialized final
-        layer makes the enabled residual branch an identity at initialization.
+        CNN mode adapts H and preserves mean/max; Jet mode adapts all of A with
+        an independent pre-LN. A zero final layer initially preserves either.
         """
         if expert_features.ndim != 3 or expert_features.shape[-1] != self.expert_feature_dim:
             raise ValueError("expert_features must have shape [batch, patches, expert_feature_dim]")
         direct = expert_features
         if self.direct_mlp is not None:
-            hidden = expert_features[..., :self.config.mask_hidden_size]
-            statistics = expert_features[..., self.config.mask_hidden_size:]
-            direct = torch.cat((hidden + self.direct_mlp(hidden), statistics), dim=-1)
+            if self.config.mask_encoder_type == "siglip_jet":
+                direct = expert_features + self.direct_mlp(self.direct_norm(expert_features))
+            else:
+                hidden = expert_features[..., :self.config.mask_hidden_size]
+                statistics = expert_features[..., self.config.mask_hidden_size:]
+                direct = torch.cat((hidden + self.direct_mlp(hidden), statistics), dim=-1)
         if valid_tokens is not None:
             if valid_tokens.shape != expert_features.shape[:2]:
                 raise ValueError("valid_tokens must match batch and patch dimensions")
@@ -229,21 +251,26 @@ class ExpertMaskFusion(nn.Module):
     def encode_prior(
         self,
         expert_features: Tensor,
-        grid_shape: Tuple[int, int],
+        grid_shape: Optional[Tuple[int, int]] = None,
         valid_tokens: Optional[Tensor] = None,
     ) -> Tensor:
         if expert_features.ndim != 3 or expert_features.shape[-1] != self.expert_feature_dim:
             raise ValueError("expert_features must have shape [batch, patches, expert_feature_dim]")
-        if grid_shape[0] * grid_shape[1] != expert_features.shape[1]:
-            raise ValueError("Position grid must match the expert feature sequence")
-        position = position_encoding_2d(
-            *grid_shape, self.config.position_dim,
-            device=expert_features.device, dtype=expert_features.dtype,
-        )
-        expert = self.expert_projection(expert_features)
-        spatial = self.position_projection(position).unsqueeze(0).expand(expert.shape[0], -1, -1)
-        # E really is [U; R]. There is no extra projection/compression before Q/K.
-        prior = self.prior_norm(torch.cat((expert, spatial), dim=-1))
+        if self.config.mask_encoder_type == "siglip_jet":
+            # Learned SigLIP positions are already present in A. The direct
+            # residual MLP must not affect this mask-only attention prior.
+            prior = self.prior_norm(expert_features)
+        else:
+            if grid_shape is None or grid_shape[0] * grid_shape[1] != expert_features.shape[1]:
+                raise ValueError("Position grid must match the expert feature sequence")
+            position = position_encoding_2d(
+                *grid_shape, self.config.position_dim,
+                device=expert_features.device, dtype=expert_features.dtype,
+            )
+            expert = self.expert_projection(expert_features)
+            spatial = self.position_projection(position).unsqueeze(0).expand(expert.shape[0], -1, -1)
+            # E really is [U; R]. There is no extra projection/compression before Q/K.
+            prior = self.prior_norm(torch.cat((expert, spatial), dim=-1))
         if valid_tokens is not None:
             if valid_tokens.shape != expert_features.shape[:2]:
                 raise ValueError("valid_tokens must match batch and patch dimensions")
@@ -253,10 +280,12 @@ class ExpertMaskFusion(nn.Module):
     def forward(
         self,
         image_features: Tensor,
-        masks: Optional[Tensor],
+        masks: Optional[Tensor] = None,
         mask_valid: Optional[Tensor] = None,
         *,
         mask_only: bool = False,
+        expert_features: Optional[Tensor] = None,
+        valid_tokens: Optional[Tensor] = None,
     ) -> Tensor:
         if image_features.ndim != 3 or image_features.shape[-1] != self.vision_dim:
             raise ValueError("image_features must have shape [batch, patches, vision_dim]")
@@ -267,12 +296,29 @@ class ExpertMaskFusion(nn.Module):
         if self.config.mode == "none" and not mask_only:
             direct = image_features.new_zeros(*image_features.shape[:2], self.expert_feature_dim)
             return torch.cat((image_features, direct), dim=-1)
-        if masks is None:
-            raise ValueError("Mask inputs are required when fusion is enabled")
-        masks = masks.to(device=image_features.device)
-        if mask_valid is not None:
-            mask_valid = mask_valid.to(device=image_features.device)
-        expert, valid_tokens, grid_shape = self.encode_masks(masks, mask_valid)
+        if self.config.mask_encoder_type == "siglip_jet":
+            if (not isinstance(expert_features, Tensor) or expert_features.ndim != 3
+                    or expert_features.shape != image_features.shape
+                    or not expert_features.is_floating_point()):
+                raise ValueError("siglip_jet expert_features must be floating-point [batch, patches, vision_dim] matching image_features")
+            if (not isinstance(valid_tokens, Tensor) or valid_tokens.dtype != torch.bool
+                    or valid_tokens.shape != image_features.shape[:2]):
+                raise ValueError("siglip_jet valid_tokens must be boolean [batch, patches]")
+            valid_tokens = valid_tokens.to(device=image_features.device)
+            expert = expert_features.to(device=image_features.device, dtype=image_features.dtype)
+            expert = expert.masked_fill(~valid_tokens.unsqueeze(-1), 0.0)
+            if not torch.isfinite(expert).all():
+                raise ValueError("Valid siglip_jet expert_features must be finite")
+            grid_shape = None
+        else:
+            if expert_features is not None or valid_tokens is not None:
+                raise ValueError("External expert_features/valid_tokens are only supported by siglip_jet")
+            if masks is None:
+                raise ValueError("Mask inputs are required when fusion is enabled")
+            masks = masks.to(device=image_features.device)
+            if mask_valid is not None:
+                mask_valid = mask_valid.to(device=image_features.device)
+            expert, valid_tokens, grid_shape = self.encode_masks(masks, mask_valid)
         if expert.shape[:2] != image_features.shape[:2]:
             raise ValueError(
                 "Mask patch grid must match vision features: "

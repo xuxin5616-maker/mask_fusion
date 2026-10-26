@@ -14,13 +14,13 @@ cd -- "${PROJECT_ROOT}"
 
 # ====================== 配置区：路径均可包含空格 ======================
 # 相对路径以项目目录为基准。新实验修改 RUN_NAME；保留旧结果，不自动覆盖。
-RUN_NAME="${RUN_NAME:-mask_residual_mlp_v1}"
+RUN_NAME="${RUN_NAME:-siglip_jet_v1}"
 START_STAGE="${START_STAGE:-1}"  # 1/2/3/4，从哪个阶段开始
 END_STAGE="${END_STAGE:-4}"      # 例如 END_STAGE=1 只生成数据
 DRY_RUN="${DRY_RUN:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 BASE_MODEL="${BASE_MODEL:-/home/yz/xxy/data/checkpoints/llava-onevision-qwen2-7b-ov}"
-FUSION_CONFIG="${FUSION_CONFIG:-configs/residual_mlp.json}"
+FUSION_CONFIG="${FUSION_CONFIG:-configs/siglip_jet.json}"
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-configs/zero3.json}"
 LOG_DIR="${LOG_DIR:-outputs/${RUN_NAME}/logs}"
 
@@ -44,7 +44,8 @@ SYNTHETIC_VAL_COUNT="${SYNTHETIC_VAL_COUNT:-200}"
 MASK_SIZE="${MASK_SIZE:-384}"
 PREVIEW_COUNT="${PREVIEW_COUNT:-16}"
 
-# 第 2 阶段：置零视觉特征，训练 mask 编码器、直通残差 MLP 及 projector 新增输入权重。
+# 第 2 阶段：RGB 特征置零；mask 在线转 Jet 后仍经冻结 SigLIP。
+# 训练 A 的直通 pre-LN 残差 MLP 及 projector 新增输入列，不更新 SigLIP。
 # square 保留完整 mask，不能改为 ROI 裁剪，否则几何题的答案可能失效。
 PRETRAIN_OUTPUT="${PRETRAIN_OUTPUT:-outputs/${RUN_NAME}/pretrain}"
 PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-3}"
@@ -59,8 +60,8 @@ TRAIN_FILES=(
     "/home/yz/xxy/data/datasets/Triad_train_data/hdd2/movable/CoTM/CoTM_musc_muscv2_classnorm_group_score.json"
 )
 VAL_FILES=()  # 可选真实验证集；不要填写最终测试集
-# root 是 JSON 内相对 image/mask 路径的前缀，沿用此前跑通的训练配置。
-TRAIN_DATA_ROOT="${TRAIN_DATA_ROOT:-/home/yz/xxy/data}"
+# root 是 JSON 内相对 image/mask 路径的前缀；本数据包含 Triad_train_data/...。
+TRAIN_DATA_ROOT="${TRAIN_DATA_ROOT:-/home/yz/xxy/data/datasets}"
 VAL_DATA_ROOT="${VAL_DATA_ROOT:-${TRAIN_DATA_ROOT}}"
 REQUIRE_DISJOINT_CATEGORIES="${REQUIRE_DISJOINT_CATEGORIES:-1}"
 SFT_OUTPUT="${SFT_OUTPUT:-outputs/${RUN_NAME}/sft}"

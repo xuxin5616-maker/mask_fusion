@@ -25,7 +25,7 @@ def parse_args(argv=None):
     parser.add_argument("--data", required=True, nargs="+", action="extend", metavar="FILE", help="One or more training JSONL/JSON files; may repeat --data")
     parser.add_argument("--output", required=True)
     parser.add_argument("--training-stage", choices=("sft", "mask_pretrain"), default="sft",
-                        help="mask_pretrain uses zero visual features and trains only the mask encoder and new projector columns")
+                        help="mask_pretrain zeroes RGB features; trains the CNN or frozen-SigLIP mask adapter and new projector columns")
     parser.add_argument("--fusion-config", help="Optional fusion configuration JSON")
     parser.add_argument("--vision-tower", help="Optional local SigLIP directory overriding the checkpoint's vision tower path")
     parser.add_argument("--image-mode", default="anyres_max_9")

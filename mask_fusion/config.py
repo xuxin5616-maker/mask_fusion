@@ -12,8 +12,8 @@ from typing import Any, Dict, Mapping
 class FusionConfig:
     """Sizes and ablations independent of a checkpoint's vision architecture.
 
-    ``expert_dim`` and ``position_hidden_size`` are concatenated to form E;
-    they are not required to equal the vision tower's output width.
+    In CNN mode, ``expert_dim`` and ``position_hidden_size`` form E. Jet mode
+    uses the actual vision-tower width for its expert features and prior.
     All modes retain the same extended projector input width.
     """
 
@@ -31,6 +31,7 @@ class FusionConfig:
     mode: str = "both"
     direct_residual_mlp: bool = False
     direct_mlp_hidden_size: int = 256
+    mask_encoder_type: str = "cnn"
 
     def __post_init__(self) -> None:
         for name in (
@@ -58,13 +59,17 @@ class FusionConfig:
                 raise ValueError(f"{name} must be a boolean")
         if self.mode not in ("both", "direct", "attention", "none"):
             raise ValueError("mode must be one of: both, direct, attention, none")
+        if self.mask_encoder_type not in ("cnn", "siglip_jet"):
+            raise ValueError("mask_encoder_type must be one of: cnn, siglip_jet")
 
     @property
     def expert_feature_dim(self) -> int:
+        """CNN feature width; use ExpertMaskFusion.expert_feature_dim in Jet mode."""
         return self.mask_hidden_size + 2
 
     @property
     def prior_dim(self) -> int:
+        """CNN prior width; Jet mode obtains its width from the vision tower."""
         return self.expert_dim + self.position_hidden_size
 
     def to_dict(self) -> Dict[str, Any]:

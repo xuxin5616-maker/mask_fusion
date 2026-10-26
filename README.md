@@ -6,6 +6,55 @@
 
 ## 模型结构
 
+### 当前默认：Jet SigLIP 双通路
+
+一键流程使用 `configs/siglip_jet.json`。连续单通道 mask 先完成与原图一致的裁剪、缩放和 padding，再按固定尺度转为 Jet RGB；随后使用与原图**同一套冻结 SigLIP 权重**提取 mask 特征 A。Jet 映射在线完成，不需要预存 RGB 热力图。数据文件仍保存原始单通道分数，不能替换成带坐标轴、色条或标注的热力图截图。
+
+```mermaid
+flowchart LR
+    RGB[原图及对应裁剪] --> SX[共享冻结 SigLIP]
+    SX --> X[视觉特征 X]
+    MASK[连续标量 mask] --> GEOM[匹配裁剪和缩放]
+    GEOM --> JET[固定 Jet RGB]
+    JET --> SA[共享冻结 SigLIP]
+    SA --> A[mask 特征 A]
+    A --> QLN[QK 的 LayerNorm]
+    QLN --> QK[独立 Q 和 K 投影]
+    X --> V[V 投影]
+    QK --> ATT[一层 8 头注意力]
+    V --> ATT
+    ATT --> RES[视觉残差 X_tilde]
+    X --> RES
+    A --> DLN[直通分支独立 pre-LN]
+    DLN --> MLP[MLP 1152 → 512 → 1152]
+    A --> AD[A_direct = A + MLP输出]
+    MLP --> AD
+    AD --> CAT[通道拼接]
+    RES --> CAT
+    CAT --> PROJ[扩展原 projector]
+    PROJ --> QWEN[冻结 Qwen]
+```
+
+下表省略 batch 维，数字对应 SigLIP so400m-patch14-384；实际特征宽度和 patch 大小从加载的 tower 读取。
+
+| 阶段 | 计算 | 每个视图的输出 |
+|---|---|---|
+| RGB 视觉特征 X | 冻结 SigLIP 编码原图视图 | `729 × 1152` |
+| mask 特征 A | `SigLIP(Preprocess(JetRGB(mask)))`，固定 0–255 色标，原有 SigLIP 预处理只执行一次 | `729 × 1152` |
+| 直通适配器 | `A_direct = A + Linear(512,1152)(GELU(Linear(1152,512)(LN_direct(A))))` | `729 × 1152` |
+| 注意力 Q/K | 对**原 A** 做 `LN_qk` 后分别线性投影；不使用 A_direct | Q/K 均为 8 heads，每头 32 维 |
+| 注意力 V | 线性投影 RGB 特征 X | 8 heads，每头 32 维 |
+| 视觉残差 | `X_tilde = X + alpha * W_O(attention(Q,K,V))` | `729 × 1152` |
+| projector 输入 | `[X_tilde; A_direct]` | `729 × 2304` |
+
+`LN_direct` 与 `LN_qk` 是独立模块。直通 MLP 末层权重和偏置零初始化，初始 `A_direct=A`。新分支不使用外部二维位置编码、U/R 映射、patch 均值或最大值；SigLIP 自身的预训练位置编码保留。`num_layers=1` 仍是一层 8 头注意力及视觉残差，没有额外视觉 FFN；直通 MLP 不是第二层 Transformer。
+
+真实数据 SFT 更新直通适配器、Q/K 的归一化、Q/K/V/O 投影、alpha 和整个 projector；共享 SigLIP、Qwen、外部 MuSc V2 均冻结。原图和 mask 都需要 SigLIP 前向，但不会创建或训练第二套 SigLIP 权重。
+
+旧 CNN adapter 的专家宽度为 130，新分支为 1152，结构和 projector 输入列均不同。旧权重仍可按保存配置推理，但**不能直接作为 Jet SigLIP 的 `--init-adapter` 或 `--resume`**。请用新实验目录从原 LLaVA 底座开始 Jet 预训练，后续 SFT 只接入本分支的预训练输出；不要把 `PRETRAIN_OUTPUT` 指向旧 CNN 实验。
+
+### 保留的 CNN 对照分支
+
 ```mermaid
 flowchart LR
     I[原图及对应裁剪] --> VT[冻结 SigLIP]
@@ -36,7 +85,7 @@ flowchart LR
     PROJ --> LLM[冻结 Qwen LLM]
 ```
 
-上图和下表对应一键流程默认的 `configs/residual_mlp.json`，省略 batch 维。旧版 `configs/default.json` 不启用直通残差 MLP，保留为对照。视觉维度和 patch 大小从加载的 tower 读取；表内数字对应仓库的 SigLIP so400m-patch14-384。
+本节图表对应保留的 CNN 配置 `configs/residual_mlp.json`，省略 batch 维。`configs/default.json` 是不启用直通残差 MLP 的 CNN 对照。视觉维度和 patch 大小从加载的 tower 读取；表内数字对应仓库的 SigLIP so400m-patch14-384。
 
 | 阶段 | 计算 | 输出 |
 |---|---|---|
@@ -61,7 +110,7 @@ flowchart LR
 
 `configs/residual_mlp.json` 在旧 `configs/default.json` 上启用 `direct_residual_mlp=true` 和 `direct_mlp_hidden_size=256`，其余设置相同，包含 `num_layers=1`、8 个头、`alpha_init=0.01` 和 H/E LayerNorm。末层零初始化使新增直通分支初始满足 `H'=H`。这些宽度和层数是可修改的起始设置，不是已验证的最优超参数。`normalize_e=false` 可关闭注意力先验的归一化；直接进入 projector 的均值/最大值不经过 H/E 的 LayerNorm。
 
-旧 adapter 推理时按保存配置恢复旧结构；缺少新增配置字段的旧权重不会自动启用 MLP。需要升级时，显式使用 `--init-adapter 旧目录 --fusion-config configs/residual_mlp.json` 开始新实验：加载兼容的旧权重，并初始化新的残差 MLP；其余架构设置仍须匹配。`--resume` 不允许跨结构恢复旧优化器。
+在 CNN 分支内部，旧 adapter 推理时按保存配置恢复旧结构；缺少新增配置字段的旧权重不会自动启用 MLP。需要升级时，显式使用 `--init-adapter 旧目录 --fusion-config configs/residual_mlp.json` 开始新实验：加载兼容的旧权重，并初始化新的残差 MLP；其余架构设置仍须匹配。这项兼容不包含切换到 Jet SigLIP。`--resume` 不允许跨结构恢复旧优化器。
 
 2026-10-13 起，`scripts/train_zero3_2gpu.sh` 默认使用 `configs/default.json`，恢复 `normalize_hidden=true`，保留 `normalize_e=true`。两处归一化分别作用于每个 patch 的 128 维 CNN 特征 H，以及拼接后的 512 维 E；不对原始 mask 做逐图 min-max，也不对直接拼接的异常均值/最大值做 LayerNorm。`num_layers=1` 保持不变：新增模块为一层 8 头注意力加视觉残差，没有额外视觉 FFN。
 
@@ -402,6 +451,7 @@ GPU 0 和 bfloat16。图像模式从 adapter 配置读取；若保存的是 `ran
 先打开其中的 `overview.jpg`：第一行显示原图上的实际选框、原始 mask 热图和叠加图；
 后续每行按模型输入顺序显示 base、ROI 或 AnyRes tile，以及对应 mask 和叠加图。
 `view_XX_*_image.png` 由本次输入张量反归一化得到；可视化不会重新随机抽取 ROI。
+Jet SigLIP 分支另存 `view_XX_*_siglip_mask_input.png`，它是实际送入冻结 mask 编码器的 RGB 张量反归一化结果；原来的 `*_mask.png` 仍是原始连续分数的辅助显示，不应混作编码器输入。
 AnyRes 的选框从 padding 画布坐标映射回原图，精确坐标保存在 `metadata.json` 中。
 热图统一使用 `[0, fusion_config.score_scale]`（默认 0–255），不做逐图 min-max，灰色表示无效 padding。
 `mask_values.npz` 保存实际输入的浮点 `masks`、布尔 `mask_valid` 以及原分辨率的 `source_mask`；
@@ -441,9 +491,11 @@ ANOMALY_PROMPT=category-mcq bash scripts/test_mvtec.sh
 
 ## 合成 mask 预训练，再接真实数据 SFT
 
-新增入口 `python -m mask_fusion.pretrain`。第一阶段跳过 vision tower，在其输出位置构造零视觉特征，绕过注意力，只走 `[0; H'; mean; max] → projector → 冻结 Qwen`。启用新配置时 `H'=H+MLP(H)`，旧配置使用 `H'=H`。只更新 mask CNN、H 的 LayerNorm、启用的直通残差 MLP 和 projector 第一层新增的 mask 输入权重；原视觉输入权重、原 bias、projector 后续层、E 映射及注意力均冻结。首层视觉权重与 mask 权重物理拆分，AdamW 的 weight decay 也不会改动冻结部分。冻结 Qwen 仍保留反向传播到输入的计算图。
+入口为 `python -m mask_fusion.pretrain`。Jet SigLIP 第一阶段跳过 **RGB 图像的 SigLIP 前向**，构造零视觉特征 X；mask 仍在线转 Jet 并通过冻结的共享 SigLIP 得到 A。绕过注意力，只走 `[0; A_direct] → projector → 冻结 Qwen`。只更新 A 的直通 pre-LN 残差 MLP 和 projector 第一层新增的 1152 个 mask 输入列；原视觉输入权重、原 bias、projector 后续层、Q/K 归一化和注意力均冻结。首层视觉权重与 mask 权重物理拆分，AdamW 的 weight decay 也不会改动冻结部分。冻结 Qwen 仍保留反向传播到输入的计算图。
 
-预训练保存时把首层重新合并为标准 Linear，导出的 `adapter.safetensors` 可直接用于第二阶段的权重初始化。第一阶段新增 mask 列初始为零时，第一次更新主要发生在这些列；列更新后，后续步骤才会给 mask CNN 提供直接通路的梯度。新残差 MLP 的末层也从零开始，因此其首层需要末层先更新才获得非零数据梯度；这是初始化策略的预期行为。
+预训练保存时把首层重新合并为标准 Linear，导出的 `adapter.safetensors` 可直接用于本分支第二阶段的权重初始化。第一阶段新增 mask 列初始为零时，第一次更新主要发生在这些列；列更新后，后续步骤才会给 A 的适配器提供直接通路的梯度。残差 MLP 的末层也从零开始，因此其首层和 pre-LN 需要末层先更新才获得非零数据梯度。
+
+若显式选择保留的 CNN 配置，第一阶段仍走 `[0; H'; mean; max]`，训练 mask CNN、H 的 LayerNorm、启用的直通 MLP 和新增 projector 列；该旧分支才会完全跳过 vision tower。
 
 ### 一键执行生成、单卡/多卡预训练、真实数据 SFT 和测试
 
@@ -456,38 +508,42 @@ DRY_RUN=1 bash scripts/run_mask_pretrain_pipeline.sh
 # 顺序执行全部阶段；任一步失败即停止，日志自动保存
 bash scripts/run_mask_pretrain_pipeline.sh
 
-# 数据已生成，使用 0 号卡完成预训练、SFT 和测试
-START_STAGE=2 TRAIN_GPUS=0 TEST_GPU=0 DTYPE=bfloat16 \
+# 复用之前的单通道合成 mask，在物理 GPU 6 开始全新的 Jet SigLIP 实验
+TRAIN_GPUS=6 TEST_GPU=6 START_STAGE=2 RUN_NAME=siglip_jet_v1 \
+  SYNTHETIC_DATA_DIR=data/synthetic_masks_mask_residual_mlp_v1 \
+  DTYPE=bfloat16 ATTN_IMPLEMENTATION=flash_attention_2 \
   bash scripts/run_mask_pretrain_pipeline.sh
 
 # 同一实验的前两步已完成时，从真实数据训练开始（不是阶段内断点续训）
 START_STAGE=3 bash scripts/run_mask_pretrain_pipeline.sh
 
 # 新实验修改名称，各阶段默认输出路径会一起改变
-RUN_NAME=mask_residual_mlp_v2 bash scripts/run_mask_pretrain_pipeline.sh
+RUN_NAME=siglip_jet_v2 bash scripts/run_mask_pretrain_pipeline.sh
 
 # 旧版无直通 MLP 对照，使用单独目录
 RUN_NAME=mask_without_direct_mlp_v1 FUSION_CONFIG=configs/default.json \
   bash scripts/run_mask_pretrain_pipeline.sh
 ```
 
-一键流程默认使用 `configs/residual_mlp.json`，生成 2,000/200 张训练/验证 mask；预训练和 SFT 均用 GPU `0,1`、FP32、3 epochs、单卡 batch 1、累积 4 步，测试使用 GPU `0`、FP32、类别 A/B 提示词并保存全部可视化。预训练固定 `square`；SFT 默认为 `randomroi`；测试从 SFT adapter 读取图像模式。SFT 通过 `--init-adapter` 接入预训练最终权重，继续训练整个 fusion（包含新直通 MLP）和 projector，vision tower/Qwen 保持冻结。沿用原来的一键命令会进入新的 `mask_residual_mlp_v1` 实验目录；原 `mask_reference_v1` 结果保留。
+一键流程默认使用 `configs/siglip_jet.json`，生成 2,000/200 张训练/验证 mask；预训练和 SFT 默认用 GPU `0,1`、FP32、3 epochs、单卡 batch 1、累积 4 步，测试使用 GPU `0`、FP32、类别 A/B 提示词并保存全部可视化。上面的 GPU 6 命令显式覆盖为单卡、BF16、FlashAttention 2，并跳过生成阶段，直接复用旧单通道合成数据；需使用已安装匹配 `flash-attn` 的训练环境。Jet 在模型输入路径上计算，无需重新生成 PNG 或 QA。
+
+预训练固定 `square`；SFT 默认为 `randomroi`；测试从 SFT adapter 读取图像模式。SFT 通过 `--init-adapter` 接入**本次 Jet SigLIP** 预训练最终权重，更新 A 适配器、注意力和整个 projector，共享 SigLIP/Qwen 保持冻结。新默认目录为 `siglip_jet_v1`，原 CNN 实验结果保留。不要同时设置指向旧 CNN 目录的 `PRETRAIN_OUTPUT`；这会造成跨结构加载错误。
 
 `TRAIN_GPUS` 决定训练卡数和编号：`TRAIN_GPUS=2` 使用 2 号卡，通过普通 `python -m` 和 `--distributed none` 训练，不需要 DeepSpeed；`TRAIN_GPUS=2,3` 使用两张卡，通过 ZeRO-3 分片训练。多卡进程数自动等于列表长度，编号不能重复。`TEST_GPU` 单独选择一张测试卡，单卡训练时可设成同一编号。单卡完整加载 7B 模型，不能获得多卡的参数分片省显存效果；示例使用 A100 支持的 BF16 减少显存，实际容量仍受视图数和文本长度影响。
 
 有效 batch 为 `训练卡数 × 每卡 batch × 梯度累积步数`。默认双卡为 8，单卡沿用默认累积 4 时为 4；需要保持 8 时同时设置 `PRETRAIN_GRAD_ACCUM=8 SFT_GRAD_ACCUM=8`。跨卡数或训练后端使用已训练权重初始化新阶段可通过 `--init-adapter`；阶段内 `--resume` 要沿用原后端和卡数。
 
-顶部可修改两份 `TRAIN_FILES`、可选 `VAL_FILES`、三个阶段各自的数据根目录、模型路径、GPU、学习率、epochs、生成数量和输出目录。数组路径用空格或换行分隔，不加逗号。`TRAIN_DATA_ROOT` 沿用此前 `/home/yz/xxy/data`，`TEST_DATA_ROOT` 为 `/home/yz/xxy/data/datasets`；请对应 JSON 内部的相对路径修改。合成数据的两个 root 均自动绑定到生成目录。相对路径统一以项目目录为基准。
+顶部可修改两份 `TRAIN_FILES`、可选 `VAL_FILES`、三个阶段各自的数据根目录、模型路径、GPU、学习率、epochs、生成数量和输出目录。数组路径用空格或换行分隔，不加逗号。`TRAIN_DATA_ROOT` 和 `TEST_DATA_ROOT` 默认均为 `/home/yz/xxy/data/datasets`：训练记录包含 `Triad_train_data/...`，测试记录包含 `Traid_eval_data/...`。root 与记录中的相对路径拼接后必须指向实际文件；修改 JSON 所在目录不会改变显式 root。合成数据的两个 root 均自动绑定到生成目录。相对路径统一以项目目录为基准。
 
-默认 `RUN_NAME=mask_residual_mlp_v1` 的输出为：
+默认 `RUN_NAME=siglip_jet_v1` 的输出为：
 
-- 合成数据：`data/synthetic_masks_mask_residual_mlp_v1/`。
-- 预训练权重：`outputs/mask_residual_mlp_v1/pretrain/`；SFT 权重：`outputs/mask_residual_mlp_v1/sft/`。
-- 阶段日志：`outputs/mask_residual_mlp_v1/logs/{1_generate,2_pretrain,3_sft,4_test}.log`。
-- 测试结果：`results/mvtec_mask_residual_mlp_v1.jsonl` 和 `results/mvtec_mask_residual_mlp_v1.metrics.json`。
-- 全量可视化：`results/mvtec_mask_residual_mlp_v1_vis/`。
+- 合成数据：从阶段 1 开始时写入 `data/synthetic_masks_siglip_jet_v1/`；上述 GPU 6 命令复用 `data/synthetic_masks_mask_residual_mlp_v1/`。
+- 预训练权重：`outputs/siglip_jet_v1/pretrain/`；SFT 权重：`outputs/siglip_jet_v1/sft/`。
+- 阶段日志：`outputs/siglip_jet_v1/logs/{1_generate,2_pretrain,3_sft,4_test}.log`；从阶段 2 开始不写生成日志。
+- 测试结果：`results/mvtec_siglip_jet_v1.jsonl` 和 `results/mvtec_siglip_jet_v1.metrics.json`。
+- 全量可视化：`results/mvtec_siglip_jet_v1_vis/`。
 
-已有数据/训练输出/测试结果不会自动覆盖或跳过；重复全流程使用新的 `RUN_NAME`。`START_STAGE` / `END_STAGE` 取 1–4，例如 `END_STAGE=1` 只生成数据，`START_STAGE=4` 只测试已完成的 SFT。阶段中途失败需要恢复优化器时，使用原单阶段脚本的 `--resume`，不要把 `START_STAGE` 当作断点恢复。
+已有数据/训练输出/测试结果不会自动删除、覆盖或跳过；重复全流程使用新的 `RUN_NAME`。`START_STAGE` / `END_STAGE` 取 1–4，例如 `END_STAGE=1` 只生成数据，`START_STAGE=4` 只测试已完成的 SFT。阶段中途失败需要恢复优化器时，使用相同阶段、相同配置的训练入口加 `--resume`，不要把 `START_STAGE` 当作断点恢复。
 
 ### 生成并检查样本
 
@@ -519,40 +575,42 @@ python -m mask_fusion.synthetic_masks \
 
 若之前已经生成过旧版 `data/synthetic_masks`，可改用 `--output data/synthetic_masks_reference`，训练时设置 `SYNTHETIC_DATA_DIR=data/synthetic_masks_reference`；已有 PNG/QA 不会因为修改配置而自动更新。
 
-该 SigLIP 的 patch 为 14×14，384×384 输入实际编码左上 378×378；所有合成答案从保存后的 PNG 可见区域重新计算，避免不可见边缘决定标签。第一阶段只允许 `square`，且训练前检查 mask 和占位图必须匹配 tower 的原尺寸，防止缩放/ROI 改变答案。JSON 的 `image` 字段复用 mask PNG 作为数据接口占位；它不会进入 vision tower，**这些 JSON 不要作为普通真实图像 SFT 数据使用**。
+该 SigLIP 的 patch 为 14×14，384×384 输入实际编码左上 378×378；所有合成答案从保存后的 PNG 可见区域重新计算，避免不可见边缘决定标签。第一阶段只允许 `square`，且训练前检查 mask 和占位图必须匹配 tower 的原尺寸，防止缩放/ROI 改变答案。同尺寸标量 mask 保持原像素，在线 Jet 是逐像素固定映射，之后不再改变几何，因此现有单通道合成数据可直接复用。标签仍依据原始分数，不根据 Jet 的 RGB 亮度重新计算。
+
+JSON 的 `image` 字段复用 mask PNG 作为数据接口占位；它不会进入 RGB 图像分支的 SigLIP 前向。真正的 mask 通过 `mask` 字段在线转 Jet 后进入冻结 SigLIP。**这些合成 JSON 不要作为普通真实图像 SFT 数据使用**。
 
 ### 双卡预训练
 
 ```bash
 # 先查看实际将执行的命令，不启动训练
 DRY_RUN=1 bash scripts/pretrain_mask_zero3_2gpu.sh \
-  --fusion-config configs/residual_mlp.json --output outputs/mask_residual_mlp_pretrain_zero3
+  --fusion-config configs/siglip_jet.json --output outputs/siglip_jet_pretrain_zero3
 
 # 默认使用物理 GPU 0、1，ZeRO-3，BF16；沿用 FP32 实验可显式覆盖
 CUDA_VISIBLE_DEVICES=0,1 bash scripts/pretrain_mask_zero3_2gpu.sh \
-  --dtype float32 --fusion-config configs/residual_mlp.json \
-  --output outputs/mask_residual_mlp_pretrain_zero3
+  --dtype float32 --fusion-config configs/siglip_jet.json \
+  --output outputs/siglip_jet_pretrain_zero3
 ```
 
-单阶段脚本保留旧默认：读取 `data/synthetic_masks/train.jsonl` 和 `val.jsonl`，使用 `configs/default.json`，输出到 `outputs/mask_pretrain_zero3`。上面的命令显式选择新残差 MLP 配置和独立输出目录。支持 `SYNTHETIC_DATA_DIR`、`BASE_MODEL`、`OUTPUT_DIR`、`DATA_ROOT` 等环境变量，以及 `--data train1.jsonl train2.jsonl` / `--val-data val.jsonl` 多文件参数。相对图片路径默认相对于各 JSON；给合成数据沿用真实数据的 `DATA_ROOT` 会改变解析位置，通常无需设置。修改生成目录可用 `SYNTHETIC_DATA_DIR=新目录`。
+单阶段脚本保留旧默认：读取 `data/synthetic_masks/train.jsonl` 和 `val.jsonl`，使用 CNN 配置 `configs/default.json`，输出到 `outputs/mask_pretrain_zero3`。上面的命令显式选择 Jet SigLIP 配置和独立输出目录。支持 `SYNTHETIC_DATA_DIR`、`BASE_MODEL`、`OUTPUT_DIR`、`DATA_ROOT` 等环境变量，以及 `--data train1.jsonl train2.jsonl` / `--val-data val.jsonl` 多文件参数。相对图片路径默认相对于各 JSON；给合成数据沿用真实数据的 `DATA_ROOT` 会改变解析位置，通常无需设置。修改生成目录可用 `SYNTHETIC_DATA_DIR=新目录`。
 
-沿用已有 DeepSpeed 依赖和 ZeRO-3 配置。预训练阶段冻结大模型仍需要通过 Qwen 做前向和输入梯度反传，因此并非只训练小 CNN 的计算成本。验证集会记录答案 token loss，并按最低验证 loss 保存 `best/`；合成验证 loss 不能代表真实缺陷准确率。
+多卡沿用已有 DeepSpeed 依赖和 ZeRO-3 配置。Jet 预训练仍需要 mask SigLIP 前向，以及 Qwen 前向和输入梯度反传；冻结不等于跳过计算。验证集会记录答案 token loss，并按最低验证 loss 保存 `best/`；合成验证 loss 不能代表真实缺陷准确率。
 
 ### 用原来的真实数据开始第二阶段
 
 ```bash
 DATA_ROOT=/home/yz/xxy/data/datasets \
 bash scripts/train_zero3_2gpu.sh \
-  --init-adapter outputs/mask_residual_mlp_pretrain_zero3 \
-  --fusion-config configs/residual_mlp.json \
+  --init-adapter outputs/siglip_jet_pretrain_zero3 \
+  --fusion-config configs/siglip_jet.json \
   --data /absolute/path/train_a.json /absolute/path/train_b.json \
   --dtype float32 --image-mode randomroi \
-  --output outputs/zero3_after_mask_residual_mlp_pretrain
+  --output outputs/zero3_after_siglip_jet_pretrain
 ```
 
 将 `--data` 和 `DATA_ROOT` 换成原来真实训练使用的值；原脚本已填写 `TRAIN_FILES` 时可以省略 `--data`。`--init-adapter` 仅加载权重，重新初始化优化器、调度器和训练步数，显式允许从预训练 `square` 切换到真实训练的 `randomroi` / `anyres_max_9`。恢复真实图像、注意力和正常训练配置：训练整个 fusion 与整个 projector，继续冻结专家模型、vision tower 和 Qwen。两个阶段应使用相同的原 LLaVA checkpoint 和兼容的 fusion 配置。
 
-旧版无直通 MLP 的预训练 adapter 也可作为 `--init-adapter` 来源，配合 `--fusion-config configs/residual_mlp.json` 显式升级。仅允许新增这条残差分支，其余架构设置须兼容；新增末层零初始化，旧均值/最大值和注意力参数继续保留。
+Jet SigLIP 的第二阶段只接受兼容的 Jet SigLIP adapter。旧 CNN 预训练权重不能直接接入；保留的 CNN 无 MLP → CNN 残差 MLP 升级功能也不意味着可以跨到 Jet SigLIP。
 
 `--resume` 只用于同一阶段、相同结构的断点续训，不能和 `--init-adapter` 同时使用；直接把预训练 checkpoint 当作 SFT `--resume`，或把旧无 MLP checkpoint 当作新结构续训，都会报错。第二阶段再次续训传自己的 `--resume` 并保留对应 `--fusion-config`，无需再次提供预训练目录。第一阶段导出的是初始化权重，还不能据此宣称真实图像融合已经训练好。
 
