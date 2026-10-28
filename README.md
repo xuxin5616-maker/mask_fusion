@@ -1,14 +1,56 @@
 # LLaVA Mask Fusion
 
-基于工作区 `llava_pruning` 的 LLaVA-OneVision / Qwen2 / SigLIP 路径，实现连续专家异常图的双通路融合。新增代码在 `mask_fusion/`；原模型运行时保留在 `vendor/llava/`。
+基于工作区 `llava_pruning` 的 LLaVA-OneVision / Qwen2 / SigLIP 路径，实现连续专家异常图引导的视觉融合。新增代码在 `mask_fusion/`；原模型运行时保留在 `vendor/llava/`。
 
 当前入口支持单张原图、多视图（AnyRes/ROI）和多条 QA，训练支持单 GPU 或双 GPU FSDP SFT；也能在 CPU 上运行小模型测试。MuSc V2 作为外部冻结专家，输入它预先生成的连续分数图。本项目不包含 MuSc V2 的生成器、基础模型权重或真实训练数据。
 
 ## 模型结构
 
-### 当前默认：Jet SigLIP 双通路
+### 当前实验：CNN + 注意力，projector 仅接收视觉特征
 
-一键流程使用 `configs/siglip_jet.json`。连续单通道 mask 先完成与原图一致的裁剪、缩放和 padding，再按固定尺度转为 Jet RGB；随后使用与原图**同一套冻结 SigLIP 权重**提取 mask 特征 A。Jet 映射在线完成，不需要预存 RGB 热力图。数据文件仍保存原始单通道分数，不能替换成带坐标轴、色条或标注的热力图截图。
+使用 `configs/cnn_attention_only.json` 和 `scripts/run_cnn_attention_pipeline.sh` 从原 LLaVA 底座重新做真实数据 SFT，再测试。这个入口不读取旧 CNN/Jet adapter，不生成合成数据，也不执行置零图像的 mask-only 预训练。
+
+数据流为：`原图 → 冻结 SigLIP → X`；`原始单通道 mask → 原有 CNN → A=[H;mean;max] → U`，原有二维位置编码经 R 映射后与 U 拼接，得到 `E=LN([U;R])`。独立 Q/K 投影读取 E，V 投影读取 X，一层 8 头注意力产生 `X_tilde=X+alpha*deltaX`，最终仅执行 `Projector(X_tilde)`。
+
+| 模块 | 当前设置 |
+|---|---|
+| mask CNN | `Conv(1,128,k14,s14) → GELU → Conv(128,128,k3,s1,p1) → GELU → LN` |
+| Q/K 输入 | `E=[U256;R256]`，512 维，启用独立 E LayerNorm |
+| 融合注意力 | 1 层、8 头、每头 32 维；alpha 初始 0.01，可学习 |
+| projector 输入 | 仅更新后的 X，1152 维；保留原底座 projector 全部权重初始化 |
+| projector 结构 | 原来的 `1152→3584→GELU→3584`，不扩展输入列 |
+| 训练参数 | mask CNN、U/R 映射、H/E LayerNorm、Q/K/V/O、alpha、整个 projector |
+| 冻结参数 | 原图 SigLIP、Qwen、外部 MuSc V2 |
+
+均值/最大值仍是 Q/K 先验编码的输入，不直接拼接给 projector；直通残差 MLP 不创建。`direct_to_projector=false` 表示彻底移除专家输入列。旧的 `configs/attention.json` 是保留扩展列并置零的兼容消融，不等于本实验。旧 adapter 未记录该字段时按 `true` 恢复，原有实验仍可加载；跨这两种输入结构加载权重会明确报错。
+
+按目前 Linux 路径直接运行：
+
+```bash
+conda activate triad
+cd /home/yz/xxy/code/bbls/mask_fusion
+bash scripts/run_cnn_attention_pipeline.sh
+```
+
+脚本顶部集中放置模型、两份训练 JSON、可选验证集、数据根目录、测试集和超参数。默认 `RUN_NAME=cnn_attention_only_v1`、训练和测试均用 GPU 6、FP16、FlashAttention 2、`randomroi`、3 epochs、batch 1、累积 4 步；沿用最近实验的精度和推理模板。FlashAttention 2 需要环境已安装匹配的 `flash-attn`。原有底座权重会被加载，新增 CNN/注意力随机初始化，未传 `--init-adapter` 或 `--resume`。
+
+```bash
+# 只预览命令，不启动训练
+DRY_RUN=1 bash scripts/run_cnn_attention_pipeline.sh
+# 双卡训练，单卡测试
+TRAIN_GPUS=0,1 TEST_GPU=0 bash scripts/run_cnn_attention_pipeline.sh
+# 如需切回 BF16，用新实验目录
+RUN_NAME=cnn_attention_only_bf16 DTYPE=bfloat16 bash scripts/run_cnn_attention_pipeline.sh
+# 沿用原编号：3=SFT，4=测试；可只训练或只测试
+END_STAGE=3 bash scripts/run_cnn_attention_pipeline.sh
+START_STAGE=4 bash scripts/run_cnn_attention_pipeline.sh
+```
+
+输出为 `outputs/cnn_attention_only_v1/sft/`、`outputs/cnn_attention_only_v1/logs/{3_sft,4_test}.log`，以及 `results/mvtec_cnn_attention_only_v1.jsonl`、对应 `.metrics.json` 和 `_vis/` 全量可视化。已有结果不自动覆盖或删除，新实验应修改 RUN_NAME。
+
+### 保留的 Jet SigLIP 双通路
+
+旧四阶段入口 `run_mask_pretrain_pipeline.sh` 仍使用 `configs/siglip_jet.json`；当前 CNN 注意力实验请使用上面的新入口。连续单通道 mask 先完成与原图一致的裁剪、缩放和 padding，再按固定尺度转为 Jet RGB；随后使用与原图**同一套冻结 SigLIP 权重**提取 mask 特征 A。Jet 映射在线完成，不需要预存 RGB 热力图。数据文件仍保存原始单通道分数，不能替换成带坐标轴、色条或标注的热力图截图。
 
 ```mermaid
 flowchart LR

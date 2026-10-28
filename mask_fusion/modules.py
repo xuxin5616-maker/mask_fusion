@@ -158,11 +158,12 @@ class PriorAttentionLayer(nn.Module):
 
 
 class ExpertMaskFusion(nn.Module):
-    """Produce [updated visual features; direct expert features] for a projector.
+    """Produce visual features, optionally concatenated with expert features.
 
     ``both`` enables attention and direct features. ``direct`` skips attention;
     ``attention`` zeroes the direct feature slots; ``none`` returns [X; zeros].
-    Keeping these slots in every mode makes checkpoint shapes mode-independent.
+    Legacy configurations keep these slots in every mode. Explicitly setting
+    direct_to_projector=false removes them and preserves the base projector.
     """
 
     def __init__(self, vision_dim: int, patch_size: int, config: FusionConfig) -> None:
@@ -293,7 +294,11 @@ class ExpertMaskFusion(nn.Module):
             raise ValueError("image_features must contain at least one image and patch")
         if not image_features.is_floating_point():
             raise ValueError("image_features must be floating-point features")
+        if mask_only and not self.config.direct_to_projector:
+            raise ValueError("Mask-only pretraining requires a direct expert path; use real-image SFT for attention-only fusion")
         if self.config.mode == "none" and not mask_only:
+            if not self.config.direct_to_projector:
+                return image_features
             direct = image_features.new_zeros(*image_features.shape[:2], self.expert_feature_dim)
             return torch.cat((image_features, direct), dim=-1)
         if self.config.mask_encoder_type == "siglip_jet":
@@ -337,6 +342,8 @@ class ExpertMaskFusion(nn.Module):
                 # E remains purely mask/position-based at every layer; only V's
                 # visual stream is updated by preceding layers.
                 updated = layer(updated, prior, valid_tokens)
+        if not self.config.direct_to_projector:
+            return updated
         if self.config.mode == "attention":
             direct = torch.zeros_like(expert)
         else:

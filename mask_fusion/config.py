@@ -14,7 +14,8 @@ class FusionConfig:
 
     In CNN mode, ``expert_dim`` and ``position_hidden_size`` form E. Jet mode
     uses the actual vision-tower width for its expert features and prior.
-    All modes retain the same extended projector input width.
+    Legacy modes retain an extended projector input. ``direct_to_projector``
+    may explicitly remove those columns for an attention-only experiment.
     """
 
     mask_hidden_size: int = 128
@@ -32,6 +33,7 @@ class FusionConfig:
     direct_residual_mlp: bool = False
     direct_mlp_hidden_size: int = 256
     mask_encoder_type: str = "cnn"
+    direct_to_projector: bool = True
 
     def __post_init__(self) -> None:
         for name in (
@@ -54,13 +56,18 @@ class FusionConfig:
                 raise ValueError(f"{name} must be a finite number")
         if self.score_scale <= 0:
             raise ValueError("score_scale must be positive")
-        for name in ("normalize_hidden", "normalize_e", "direct_residual_mlp"):
+        for name in ("normalize_hidden", "normalize_e", "direct_residual_mlp", "direct_to_projector"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a boolean")
         if self.mode not in ("both", "direct", "attention", "none"):
             raise ValueError("mode must be one of: both, direct, attention, none")
         if self.mask_encoder_type not in ("cnn", "siglip_jet"):
             raise ValueError("mask_encoder_type must be one of: cnn, siglip_jet")
+        if not self.direct_to_projector:
+            if self.mode not in ("attention", "none"):
+                raise ValueError("direct_to_projector=false requires mode='attention' or 'none'")
+            if self.direct_residual_mlp:
+                raise ValueError("direct_to_projector=false cannot enable the direct residual MLP")
 
     @property
     def expert_feature_dim(self) -> int:

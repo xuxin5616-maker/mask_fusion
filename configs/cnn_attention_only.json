@@ -1,0 +1,17 @@
+{
+  "mask_encoder_type": "cnn",
+  "mask_hidden_size": 128,
+  "expert_dim": 256,
+  "position_dim": 128,
+  "position_hidden_size": 256,
+  "attention_dim": 256,
+  "num_heads": 8,
+  "num_layers": 1,
+  "alpha_init": 0.01,
+  "normalize_hidden": true,
+  "normalize_e": true,
+  "score_scale": 255.0,
+  "mode": "attention",
+  "direct_residual_mlp": false,
+  "direct_to_projector": false
+}

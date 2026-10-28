@@ -39,7 +39,7 @@ def configure_image_mode(config, mode):
 
 
 def attach_fusion(model, fusion_config=None):
-    """Expand an already-loaded projector without reinitializing its old columns."""
+    """Attach fusion, retaining the base projector or expanding its inputs."""
     core = model.get_model()
     if hasattr(core, "mask_fusion"):
         raise ValueError("Fusion has already been attached")
@@ -55,7 +55,12 @@ def attach_fusion(model, fusion_config=None):
     parameter = next(core.mm_projector.parameters())
     fusion = ExpertMaskFusion(vision_dim, patch_size, fusion_config)
     core.mask_fusion = fusion.to(device=parameter.device, dtype=torch.float32)
-    core.mm_projector = expand_projector(core.mm_projector, fusion.expert_feature_dim)
+    if fusion_config.direct_to_projector:
+        core.mm_projector = expand_projector(core.mm_projector, fusion.expert_feature_dim)
+    else:
+        first = core.mm_projector[0] if isinstance(core.mm_projector, torch.nn.Sequential) else core.mm_projector
+        if not isinstance(first, torch.nn.Linear) or first.in_features != vision_dim:
+            raise ValueError("Attention-only fusion requires the original visual-width projector")
     core.mm_projector.float()
     model.config.mask_fusion = asdict(fusion_config)
     model.config.mask_fusion_vision_dim = vision_dim
@@ -106,6 +111,8 @@ def configure_mask_pretraining(model):
     core = model.get_model()
     if not hasattr(core, "mask_fusion"):
         raise ValueError("Attach mask fusion before configuring mask pretraining")
+    if not core.mask_fusion.config.direct_to_projector:
+        raise ValueError("Mask-only pretraining requires direct_to_projector=true; train attention-only fusion with real-image SFT")
     if core.mask_fusion.config.mode != "both":
         raise ValueError("Mask pretraining requires fusion mode='both' for phase-2 compatibility")
     projector = core.mm_projector
